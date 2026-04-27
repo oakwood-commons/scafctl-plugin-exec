@@ -85,7 +85,7 @@ func (p *Plugin) GetProviderDescriptor(_ context.Context, providerName string) (
 			"workingDir": sdkhelper.StringProp("Working directory for command execution",
 				sdkhelper.WithExample("/tmp"),
 				sdkhelper.WithMaxLength(500)),
-			"env":     sdkhelper.AnyProp("Environment variables to set (key-value pairs). Merged with the parent process environment"),
+			"env": sdkhelper.AnyProp("Environment variables to set (key-value pairs). Merged with the parent process environment. NO_COLOR=1 and TERM=dumb are injected automatically to prevent child processes from emitting ANSI escape codes in captured output (override by setting them explicitly)"),
 			"timeout": sdkhelper.IntProp("Timeout in seconds (0 or omit for no timeout)",
 				sdkhelper.WithExample("30"),
 				sdkhelper.WithMaximum(3600.0)),
@@ -118,18 +118,38 @@ func (p *Plugin) GetProviderDescriptor(_ context.Context, providerName string) (
 		Examples: []sdkprovider.Example{
 			{
 				Name:        "Simple command execution",
-				Description: "Execute a simple echo command",
+				Description: "Execute a simple echo command \u2014 pipes and shell features work by default",
 				YAML: "name: echo-hello\nprovider: exec\ninputs:\n  command: echo \"Hello, World!\"",
 			},
 			{
+				Name:        "Command with arguments",
+				Description: "Pass explicit arguments that are automatically shell-quoted",
+				YAML: "name: echo-args\nprovider: exec\ninputs:\n  command: echo\n  args:\n    - \"Hello\"\n    - \"World\"",
+			},
+			{
 				Name:        "Pipeline command",
-				Description: "Use pipes, redirections, and shell features",
+				Description: "Use pipes, redirections, and shell features \u2014 works on all platforms",
 				YAML: "name: pipeline\nprovider: exec\ninputs:\n  command: \"echo 'hello world' | tr a-z A-Z\"",
 			},
 			{
 				Name:        "Command with timeout",
 				Description: "Run a command with a 30 second timeout",
 				YAML: "name: curl-with-timeout\nprovider: exec\ninputs:\n  command: curl -s https://api.example.com/data\n  timeout: 30",
+			},
+			{
+				Name:        "Command with custom environment",
+				Description: "Execute a script with custom environment variables and working directory",
+				YAML: "name: custom-env-script\nprovider: exec\ninputs:\n  command: ./build.sh\n  workingDir: /project/src\n  env:\n    BUILD_ENV: production\n    VERSION: \"1.0.0\"",
+			},
+			{
+				Name:        "PowerShell command",
+				Description: "Use PowerShell for Windows-specific operations",
+				YAML: "name: pwsh-example\nprovider: exec\ninputs:\n  command: \"Get-ChildItem | Select-Object Name\"\n  shell: pwsh",
+			},
+			{
+				Name:        "External bash",
+				Description: "Use an external bash shell for bash-specific features",
+				YAML: "name: bash-specific\nprovider: exec\ninputs:\n  command: 'shopt -s globstar; echo **/*.go'\n  shell: bash",
 			},
 		},
 	}, nil
@@ -275,13 +295,28 @@ func executeCommand(ctx context.Context, command string, inputs map[string]any, 
 	}
 
 	// Build environment.
+	// Inject NO_COLOR=1 and TERM=dumb to prevent child processes (especially
+	// PowerShell) from emitting ANSI escape codes in captured output, which
+	// corrupts downstream processing and breaks YAML block-scalar formatting.
 	var env []string
 	if envRaw, ok := inputs["env"]; ok && envRaw != nil {
 		envMap, ok := envRaw.(map[string]any)
 		if !ok {
 			return nil, fmt.Errorf("env must be an object with string keys")
 		}
+		if _, exists := envMap["NO_COLOR"]; !exists {
+			envMap["NO_COLOR"] = "1"
+		}
+		if _, exists := envMap["TERM"]; !exists {
+			envMap["TERM"] = "dumb"
+		}
 		env = shellexec.MergeEnv(envMap)
+	} else {
+		// No user env -- still inject NO_COLOR and TERM.
+		env = shellexec.MergeEnv(map[string]any{
+			"NO_COLOR": "1",
+			"TERM":     "dumb",
+		})
 	}
 
 	// Set up stdin.
