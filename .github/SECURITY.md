@@ -19,3 +19,12 @@ Include:
 - Steps to reproduce
 - Impact assessment
 - Any suggested fixes (optional)
+
+### Response Timeline
+
+- **Acknowledgment**: Within 48 hours
+- **Initial assessment**: Within 1 week
+- **Fix timeline**: Communicated after assessment
+
+We will coordinate disclosure with you and credit you in the advisory
+(unless you prefer to remain anonymous).
