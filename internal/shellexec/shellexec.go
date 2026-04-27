@@ -252,7 +252,7 @@ func runExternal(ctx context.Context, opts *RunOptions, binary string, shellArgs
 	execArgs = append(execArgs, shellArgs...)
 	execArgs = append(execArgs, fullCommand)
 
-	cmd := exec.CommandContext(ctx, shellPath, execArgs...)
+	cmd := exec.CommandContext(ctx, shellPath, execArgs...) //nolint:gosec // shellPath is resolved by exec.LookPath; binary name is restricted to allow-listed shell types (bash, pwsh, cmd)
 
 	if opts.Dir != "" {
 		cmd.Dir = opts.Dir
