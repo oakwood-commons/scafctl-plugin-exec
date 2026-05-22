@@ -4,9 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches:
-      - main
-      - develop
+    branches: [main]
     paths-ignore:
       - "**.md"
       - "docs/**"
@@ -23,7 +21,6 @@ permissions:
 jobs:
   lint:
     name: Lint
-    # Only run on PRs from the same repo (not forks)
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
@@ -32,17 +29,18 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - uses: golangci/golangci-lint-action@v9
+      - uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7
         with:
           version: v2.11.4
       - name: Check go mod tidy
         run: |
           go mod tidy
           git diff --exit-code go.mod go.sum
+      - name: Run govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
   test:
     name: Test
-    # Run on PRs from the same repo and on push to main
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
@@ -57,5 +55,6 @@ jobs:
         if: github.event_name == 'push'
         uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v6.0.0
         with:
+          token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage.out
           fail_ci_if_error: false

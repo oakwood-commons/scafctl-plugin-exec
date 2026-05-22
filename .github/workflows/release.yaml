@@ -35,17 +35,17 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - uses: goreleaser/goreleaser-action@1a80836c5c9d9e5755a25cb59ec6f45a3b5f41a8 # v7.2.1
+      - uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
         with:
           version: "~> v2"
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  publish-oci:
+  publish-catalog:
     outputs:
       image_ref: ${{ steps.push.outputs.image_ref }}
-    name: Publish OCI Artifact
+    name: Publish Catalog Artifact
     needs: release
     runs-on: ubuntu-latest
     permissions:
@@ -70,7 +70,8 @@ jobs:
       - name: Login to GitHub Container Registry
         run: |
           mkdir -p ~/.docker
-          echo '{"auths":{"ghcr.io":{"auth":"'"$(echo -n "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" | base64)"'"}}}' > ~/.docker/config.json
+          AUTH=$(printf '%s' "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" | base64 -w 0)
+          printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "${AUTH}" > ~/.docker/config.json
 
       - name: Download release archives
         env:
@@ -103,17 +104,23 @@ jobs:
             rm -rf tmp_windows_amd64
           fi
 
-      - name: Build and push OCI artifact
+          archive="${BINARY}_windows_arm64.zip"
+          if [ -f "${archive}" ]; then
+            mkdir -p tmp_windows_arm64
+            unzip -o "${archive}" -d tmp_windows_arm64
+            mv "tmp_windows_arm64/${BINARY}.exe" "${BINARY}-windows-arm64.exe"
+            rm -rf tmp_windows_arm64
+          fi
+
+      - name: Build and push catalog artifact
         id: push
         run: |
           VERSION="${GITHUB_REF#refs/tags/v}"
           BINARY="scafctl-plugin-exec"
-          NAME="exec"
-          CATALOG="ghcr.io/oakwood-commons"
-          IMAGE="${CATALOG}/providers/${NAME}"
 
           scafctl build plugin \
-            --name "${NAME}" \
+            --force \
+            --name "exec" \
             --kind "provider" \
             --version "${VERSION}" \
             --platform "linux/amd64=dist/${BINARY}-linux-amd64" \
@@ -123,22 +130,31 @@ jobs:
             --platform "windows/amd64=dist/${BINARY}-windows-amd64.exe"
 
           scafctl catalog push \
-            "${NAME}@${VERSION}" \
-            --catalog "${CATALOG}" \
+            "exec@${VERSION}" \
+            --catalog "oci://ghcr.io/${{ github.repository_owner }}" \
             --kind "provider" \
             --force
 
           # Resolve the pushed manifest digest for cosign signing
+          IMAGE="ghcr.io/${{ github.repository_owner }}/providers/exec"
           DIGEST=$(crane digest "${IMAGE}:${VERSION}")
           echo "image_ref=${IMAGE}@${DIGEST}" >> "$GITHUB_OUTPUT"
 
+      - name: Refresh catalog index
+        run: |
+          mkdir -p ~/.docker
+          AUTH=$(printf '%s' "${{ github.actor }}:${{ secrets.CATALOG_PUSH_TOKEN }}" | base64 -w 0)
+          printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "${AUTH}" > ~/.docker/config.json
+          scafctl catalog index push \
+            --catalog "oci://ghcr.io/${{ github.repository_owner }}"
+
   sign:
     name: Sign OCI Artifact
-    needs: publish-oci
-    if: needs.publish-oci.outputs.image_ref != ''
+    needs: publish-catalog
+    if: needs.publish-catalog.outputs.image_ref != ''
     permissions:
       id-token: write
       packages: write
     uses: oakwood-commons/scafctl/.github/workflows/sign-plugin.yml@sign-plugin/v1
     with:
-      image-ref: ${{ needs.publish-oci.outputs.image_ref }}
+      image-ref: ${{ needs.publish-catalog.outputs.image_ref }}

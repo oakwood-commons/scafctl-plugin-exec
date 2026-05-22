@@ -14,7 +14,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Masterminds/semver/v3"
@@ -101,7 +103,8 @@ func (p *Plugin) GetProviderDescriptor(_ context.Context, providerName string) (
 				sdkhelper.WithExample("auto"),
 				sdkhelper.WithMaxLength(10)),
 			"raw":         sdkhelper.BoolProp("Return trimmed stdout string instead of the full result map. Only applies in resolver/transform mode; action mode always returns the full map"),
-			"passthrough": sdkhelper.BoolProp("Stream stdout/stderr directly to the user's terminal in real-time when terminal IO streams are available instead of capturing. Default: false"),
+			"passthrough": sdkhelper.BoolProp("Stream stdout/stderr directly to the user's terminal in real-time instead of capturing. Default: false"),
+			"echo":        sdkhelper.BoolProp("Print the resolved command to stderr before executing. Useful for debugging dynamic commands built with expr:. Default: false"),
 		}),
 		OutputSchemas: map[sdkprovider.Capability]*jsonschema.Schema{
 			sdkprovider.CapabilityFrom:      sdkhelper.AnyProp("Full result map (stdout, stderr, exitCode, success, command, shell) by default; trimmed stdout string when raw: true"),
@@ -150,6 +153,11 @@ func (p *Plugin) GetProviderDescriptor(_ context.Context, providerName string) (
 				Name:        "External bash",
 				Description: "Use an external bash shell for bash-specific features",
 				YAML: "name: bash-specific\nprovider: exec\ninputs:\n  command: 'shopt -s globstar; echo **/*.go'\n  shell: bash",
+			},
+			{
+				Name:        "Echo resolved command",
+				Description: "Print the resolved command to stderr before executing — useful for debugging dynamic commands",
+				YAML: "name: build\nprovider: exec\ninputs:\n  command: go build -trimpath -o dist/app .\n  echo: true\n  passthrough: true",
 			},
 		},
 	}, nil
@@ -236,11 +244,80 @@ func (p *Plugin) DescribeWhatIf(_ context.Context, providerName string, input ma
 	return msg, nil
 }
 
-// ExecuteProviderStream is not supported by the exec provider.
+// ExecuteProviderStream implements real-time streaming for passthrough: true
+// commands. stdout and stderr bytes are forwarded to the host as gRPC stream
+// chunks as they are produced, so long-running and blocking processes appear
+// in the terminal immediately without waiting for the process to exit.
 //
-//nolint:revive // all params required by interface
-func (p *Plugin) ExecuteProviderStream(_ context.Context, _ string, _ map[string]any, _ func(sdkplugin.StreamChunk)) error {
-	return sdkplugin.ErrStreamingNotSupported
+// For non-passthrough executions the full output is captured then sent as a
+// single result chunk (identical behaviour to ExecuteProvider).
+func (p *Plugin) ExecuteProviderStream(ctx context.Context, providerName string, inputs map[string]any, cb func(sdkplugin.StreamChunk)) error {
+	if cb == nil {
+		return fmt.Errorf("%s: stream callback must not be nil", ProviderName)
+	}
+	if inputs == nil {
+		inputs = map[string]any{}
+	}
+	if providerName != ProviderName {
+		cb(sdkplugin.StreamChunk{Error: fmt.Sprintf("unknown provider: %s", providerName)})
+		return nil
+	}
+
+	passthrough, _ := inputs["passthrough"].(bool)
+	if !passthrough {
+		// Non-passthrough: capture and send as a single result chunk.
+		output, err := p.ExecuteProvider(ctx, providerName, inputs)
+		if err != nil {
+			cb(sdkplugin.StreamChunk{Error: err.Error()})
+			return nil
+		}
+		cb(sdkplugin.StreamChunk{Result: output})
+		return nil
+	}
+
+	// Passthrough: stream stdout/stderr chunks as bytes arrive so the host
+	// can display them immediately, even if the process never exits.
+	// A shared mutex serializes concurrent writes from stdout/stderr goroutines.
+	mu := &sync.Mutex{}
+	stdoutWriter := &chunkWriter{cb: cb, isStdout: true, mu: mu}
+	stderrWriter := &chunkWriter{cb: cb, isStdout: false, mu: mu}
+	output, err := executeCommandStreamed(ctx, inputs, stdoutWriter, stderrWriter)
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		cb(sdkplugin.StreamChunk{Error: err.Error()})
+		return nil
+	}
+	cb(sdkplugin.StreamChunk{Result: output})
+	return nil
+}
+
+// chunkWriter forwards writes as StreamChunk callbacks so the host receives
+// output in real-time over the gRPC server-stream. mu serializes concurrent
+// writes from stdout and stderr goroutines in the external-shell path.
+type chunkWriter struct {
+	cb       func(sdkplugin.StreamChunk)
+	isStdout bool
+	mu       *sync.Mutex
+}
+
+func (w *chunkWriter) Write(p []byte) (int, error) {
+	if w.cb == nil {
+		return len(p), nil
+	}
+	chunk := make([]byte, len(p))
+	copy(chunk, p)
+	if w.mu != nil {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+	}
+	if w.isStdout {
+		w.cb(sdkplugin.StreamChunk{Stdout: chunk})
+	} else {
+		w.cb(sdkplugin.StreamChunk{Stderr: chunk})
+	}
+	return len(p), nil
 }
 
 // ExtractDependencies returns resolver keys this input depends on.
@@ -255,6 +332,35 @@ func (p *Plugin) ExtractDependencies(_ context.Context, _ string, _ map[string]a
 //nolint:revive // all params required by interface
 func (p *Plugin) StopProvider(_ context.Context, _ string) error {
 	return nil
+}
+
+// executeCommandStreamed is like executeCommand but accepts explicit stdout/stderr
+// writers, bypassing the IOStreams-from-context logic. Used by ExecuteProviderStream
+// to inject chunk writers that forward bytes to the gRPC server stream in real-time.
+func executeCommandStreamed(ctx context.Context, inputs map[string]any, stdoutW, stderrW io.Writer) (*sdkprovider.Output, error) {
+	// Inject passthrough writers into context so executeCommand picks them up
+	// instead of building its own from IOStreams.
+	ctx = sdkprovider.WithIOStreams(ctx, &sdkprovider.IOStreams{
+		Out:    stdoutW,
+		ErrOut: stderrW,
+	})
+	// Force passthrough path so the injected streams are used directly.
+	passthroughInputs := make(map[string]any, len(inputs))
+	for k, v := range inputs {
+		passthroughInputs[k] = v
+	}
+	passthroughInputs["passthrough"] = true
+
+	shellStr, _ := inputs["shell"].(string)
+	shell := shellexec.ShellType(shellStr)
+	if shellStr != "" && !shell.IsValid() {
+		return nil, fmt.Errorf("shell %q is not supported; valid values: sh, bash, pwsh, cmd, auto", shellStr)
+	}
+	if !shell.IsValid() {
+		shell = shellexec.ShellAuto
+	}
+	command, _ := inputs["command"].(string)
+	return executeCommand(ctx, command, passthroughInputs, shell)
 }
 
 // executeCommand runs the actual shell command.
@@ -298,11 +404,20 @@ func executeCommand(ctx context.Context, command string, inputs map[string]any, 
 	// Inject NO_COLOR=1 and TERM=dumb to prevent child processes (especially
 	// PowerShell) from emitting ANSI escape codes in captured output, which
 	// corrupts downstream processing and breaks YAML block-scalar formatting.
+	//
+	// userEnv holds a snapshot of user-provided keys (before NO_COLOR/TERM
+	// injection) so that echo: true can print only what the user specified.
 	var env []string
+	var userEnv map[string]any
 	if envRaw, ok := inputs["env"]; ok && envRaw != nil {
 		envMap, ok := envRaw.(map[string]any)
 		if !ok {
 			return nil, fmt.Errorf("env must be an object with string keys")
+		}
+		// Snapshot user keys before injecting runtime-only vars.
+		userEnv = make(map[string]any, len(envMap))
+		for k, v := range envMap {
+			userEnv[k] = v
 		}
 		if _, exists := envMap["NO_COLOR"]; !exists {
 			envMap["NO_COLOR"] = "1"
@@ -349,7 +464,8 @@ func executeCommand(ctx context.Context, command string, inputs map[string]any, 
 	passthrough, _ := inputs["passthrough"].(bool)
 
 	if passthrough {
-		// Passthrough mode: stream directly to terminal, don't capture.
+		// Passthrough mode always streams — set the flag regardless of IO source.
+		streamed = true
 		if ioStreams, ok := sdkprovider.IOStreamsFromContext(ctx); ok && ioStreams != nil {
 			if ioStreams.Out != nil {
 				stdoutWriter = ioStreams.Out
@@ -357,7 +473,12 @@ func executeCommand(ctx context.Context, command string, inputs map[string]any, 
 			if ioStreams.ErrOut != nil {
 				stderrWriter = ioStreams.ErrOut
 			}
-			streamed = true
+		} else {
+			// No host-provided IO streams — stream directly to process stdout/stderr so
+			// long-running processes produce output in real-time instead of buffering
+			// until exit.
+			stdoutWriter = os.Stdout
+			stderrWriter = os.Stderr
 		}
 	} else {
 		mode, _ := sdkprovider.ExecutionModeFromContext(ctx)
@@ -372,6 +493,36 @@ func executeCommand(ctx context.Context, command string, inputs map[string]any, 
 				}
 			}
 		}
+	}
+
+	// Echo option: print the resolved command to stderr before executing.
+	// Always writes to the terminal stderr (ioStreams.ErrOut or os.Stderr),
+	// never to the capture buffer, so it doesn't pollute data["stderr"].
+	if echo, _ := inputs["echo"].(bool); echo {
+		var echoOut io.Writer = os.Stderr
+		if ioStreams, ok := sdkprovider.IOStreamsFromContext(ctx); ok && ioStreams != nil && ioStreams.ErrOut != nil {
+			echoOut = ioStreams.ErrOut
+		}
+		var sb strings.Builder
+		sb.WriteString("> ")
+		if len(userEnv) > 0 {
+			keys := make([]string, 0, len(userEnv))
+			for k := range userEnv {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				v := fmt.Sprint(userEnv[k])
+			if strings.ContainsAny(v, " \t\"'\\") {
+				fmt.Fprintf(&sb, "%s=%q ", k, v)
+			} else {
+				fmt.Fprintf(&sb, "%s=%s ", k, v)
+			}
+			}
+		}
+		sb.WriteString(shellexec.BuildFullCommand(command, args))
+		sb.WriteString("\n")
+		_, _ = fmt.Fprint(echoOut, sb.String())
 	}
 
 	// Build run options.

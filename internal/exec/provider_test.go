@@ -6,6 +6,8 @@ package exec
 import (
 	"bytes"
 	"context"
+	"io"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +16,8 @@ import (
 	sdkprovider "github.com/oakwood-commons/scafctl-plugin-sdk/provider"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/oakwood-commons/scafctl-plugin-exec/internal/shellexec"
 )
 
 func TestGetProviders(t *testing.T) {
@@ -555,10 +559,66 @@ func TestDescribeWhatIf_UnknownProvider(t *testing.T) {
 	assert.Contains(t, err.Error(), "unknown provider")
 }
 
-func TestExecuteProviderStream_NotSupported(t *testing.T) {
+func TestExecuteProviderStream_NonPassthrough_SendsResultChunk(t *testing.T) {
+	p := NewPlugin()
+	var chunks []sdkplugin.StreamChunk
+	err := p.ExecuteProviderStream(context.Background(), ProviderName, map[string]any{
+		"command": "echo hello",
+		"shell":   "sh",
+	}, func(c sdkplugin.StreamChunk) {
+		chunks = append(chunks, c)
+	})
+	require.NoError(t, err)
+	require.Len(t, chunks, 1)
+	assert.NotNil(t, chunks[0].Result)
+	assert.NotNil(t, chunks[0].Result.Data, "non-passthrough result must carry data")
+	data, ok := chunks[0].Result.Data.(map[string]any)
+	require.True(t, ok, "result data must be map[string]any")
+	assert.Equal(t, "hello\n", data["stdout"])
+}
+
+func TestExecuteProviderStream_Passthrough_StreamsChunks(t *testing.T) {
+	p := NewPlugin()
+	var stdoutData []byte
+	err := p.ExecuteProviderStream(context.Background(), ProviderName, map[string]any{
+		"command":     "printf 'a\nb\n'",
+		"shell":       "sh",
+		"passthrough": true,
+	}, func(c sdkplugin.StreamChunk) {
+		stdoutData = append(stdoutData, c.Stdout...)
+	})
+	require.NoError(t, err)
+	assert.Contains(t, string(stdoutData), "a")
+}
+
+func TestExecuteProviderStream_NilCallback_ReturnsError(t *testing.T) {
 	p := NewPlugin()
 	err := p.ExecuteProviderStream(context.Background(), ProviderName, nil, nil)
-	assert.ErrorIs(t, err, sdkplugin.ErrStreamingNotSupported)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "callback must not be nil")
+}
+
+func TestExecuteProviderStream_UnknownProvider_SendsErrorChunk(t *testing.T) {
+	p := NewPlugin()
+	var errChunk string
+	err := p.ExecuteProviderStream(context.Background(), "unknown", map[string]any{}, func(c sdkplugin.StreamChunk) {
+		errChunk = c.Error
+	})
+	require.NoError(t, err)
+	assert.Contains(t, errChunk, "unknown provider")
+}
+
+
+func TestExecuteProviderStream_NilInputs_NoError(t *testing.T) {
+	p := NewPlugin()
+	var errChunk string
+	_ = p.ExecuteProviderStream(context.Background(), ProviderName, nil, func(c sdkplugin.StreamChunk) {
+		if c.Error != "" {
+			errChunk = c.Error
+		}
+	})
+	// nil inputs → empty command → error chunk (not a panic)
+	assert.NotEmpty(t, errChunk)
 }
 
 func TestExtractDependencies(t *testing.T) {
@@ -676,4 +736,190 @@ func TestExecuteProvider_UserCanOverrideNoColor(t *testing.T) {
 	assert.Contains(t, data["stdout"], "NO_COLOR=")
 	// Ensure it's the user's empty value, not "1".
 	assert.NotContains(t, data["stdout"], "NO_COLOR=1")
+}
+
+func TestExecuteProvider_Echo_WritesToStderr(t *testing.T) {
+	p := NewPlugin()
+
+	var termErr bytes.Buffer
+	ctx := sdkprovider.WithIOStreams(context.Background(), &sdkprovider.IOStreams{
+		ErrOut: &termErr,
+	})
+
+	_, err := p.ExecuteProvider(ctx, ProviderName, map[string]any{
+		"command": "echo hello",
+		"echo":    true,
+	})
+	require.NoError(t, err)
+	assert.Contains(t, termErr.String(), "> echo hello\n")
+}
+
+func TestExecuteProvider_Echo_WithEnv(t *testing.T) {
+	p := NewPlugin()
+
+	var termErr bytes.Buffer
+	ctx := sdkprovider.WithIOStreams(context.Background(), &sdkprovider.IOStreams{
+		ErrOut: &termErr,
+	})
+
+	_, err := p.ExecuteProvider(ctx, ProviderName, map[string]any{
+		"command": "echo hello",
+		"echo":    true,
+		"env": map[string]any{
+			"CGO_ENABLED": "0",
+			"GOOS":        "linux",
+		},
+	})
+	require.NoError(t, err)
+	// Env vars should be sorted and prepended before the command.
+	assert.Contains(t, termErr.String(), "> CGO_ENABLED=0 GOOS=linux echo hello\n")
+}
+
+func TestExecuteProvider_Echo_False_NoPrefix(t *testing.T) {
+	p := NewPlugin()
+
+	var termErr bytes.Buffer
+	ctx := sdkprovider.WithIOStreams(context.Background(), &sdkprovider.IOStreams{
+		ErrOut: &termErr,
+	})
+
+	_, err := p.ExecuteProvider(ctx, ProviderName, map[string]any{
+		"command": "echo hello",
+		"echo":    false,
+	})
+	require.NoError(t, err)
+	assert.NotContains(t, termErr.String(), "> ")
+}
+
+func TestExecuteProvider_Passthrough_NoIOStreams_UsesOsStreams(t *testing.T) {
+	p := NewPlugin()
+
+	var capturedStdout, capturedStderr io.Writer
+	mockFn := shellexec.RunFunc(func(_ context.Context, opts *shellexec.RunOptions) (*shellexec.RunResult, error) {
+		capturedStdout = opts.Stdout
+		capturedStderr = opts.Stderr
+		return &shellexec.RunResult{ExitCode: 0, Shell: shellexec.ShellAuto}, nil
+	})
+
+	// No IOStreams in context — passthrough should fall back to os.Stdout/os.Stderr.
+	ctx := shellexec.WithRunFunc(context.Background(), mockFn)
+
+	output, err := p.ExecuteProvider(ctx, ProviderName, map[string]any{
+		"command":     "echo hello",
+		"passthrough": true,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, os.Stdout, capturedStdout)
+	assert.Equal(t, os.Stderr, capturedStderr)
+	assert.True(t, output.Streamed)
+}
+
+// Integration tests: real commands, real IO wiring — prove the features
+// behave correctly end-to-end without any mocking.
+
+// TestIntegration_Echo_OnlyGoesToErrOut verifies that echo: true writes the
+// command prefix to ioStreams.ErrOut and NOT to data["stderr"], so callers
+// don't see the prefix in captured output.
+func TestIntegration_Echo_OnlyGoesToErrOut(t *testing.T) {
+	p := NewPlugin()
+
+	var termErr bytes.Buffer
+	ctx := sdkprovider.WithIOStreams(context.Background(), &sdkprovider.IOStreams{
+		ErrOut: &termErr,
+	})
+
+	output, err := p.ExecuteProvider(ctx, ProviderName, map[string]any{
+		"command": "echo hello",
+		"echo":    true,
+	})
+	require.NoError(t, err)
+	data, ok := output.Data.(map[string]any)
+	require.True(t, ok)
+
+	// Echo prefix must appear in the terminal stream.
+	assert.Contains(t, termErr.String(), "> echo hello\n", "echo prefix should go to ErrOut")
+	// Echo prefix must NOT contaminate the captured stderr returned to the caller.
+	assert.Empty(t, data["stderr"], "data[stderr] must not contain the echo prefix")
+	// The command's actual stdout must be correct.
+	assert.Equal(t, "hello\n", data["stdout"])
+}
+
+// TestIntegration_Echo_EnvVarsInPrefix verifies that env vars are shown in
+// sorted order in the echo prefix using only the user-provided vars (not the
+// auto-injected NO_COLOR/TERM).
+func TestIntegration_Echo_EnvVarsInPrefix(t *testing.T) {
+	p := NewPlugin()
+
+	var termErr bytes.Buffer
+	ctx := sdkprovider.WithIOStreams(context.Background(), &sdkprovider.IOStreams{
+		ErrOut: &termErr,
+	})
+
+	output, err := p.ExecuteProvider(ctx, ProviderName, map[string]any{
+		"command": "echo $MY_VAR",
+		"echo":    true,
+		"env": map[string]any{
+			"MY_VAR": "world",
+		},
+	})
+	require.NoError(t, err)
+	data, ok := output.Data.(map[string]any)
+	require.True(t, ok)
+
+	// Only the user-specified var should appear in the prefix — not NO_COLOR or TERM.
+	assert.Contains(t, termErr.String(), "> MY_VAR=world echo $MY_VAR\n")
+	assert.NotContains(t, termErr.String(), "NO_COLOR", "auto-injected vars must not appear in echo prefix")
+	assert.NotContains(t, termErr.String(), "TERM=", "auto-injected vars must not appear in echo prefix")
+	// Command must still execute correctly with the env var set.
+	assert.Equal(t, "world\n", data["stdout"])
+}
+
+// TestIntegration_Passthrough_StreamsToIOStreams verifies that passthrough: true
+// with ioStreams.Out set causes output to flow into the provided writer in
+// real-time, and that output.Streamed is true.
+func TestIntegration_Passthrough_StreamsToIOStreams(t *testing.T) {
+	p := NewPlugin()
+
+	var streamBuf bytes.Buffer
+	ctx := sdkprovider.WithIOStreams(context.Background(), &sdkprovider.IOStreams{
+		Out: &streamBuf,
+	})
+
+	output, err := p.ExecuteProvider(ctx, ProviderName, map[string]any{
+		"command":     "echo streamed-output",
+		"passthrough": true,
+	})
+	require.NoError(t, err)
+	data, ok := output.Data.(map[string]any)
+	require.True(t, ok)
+
+	// In passthrough mode the command output goes to ioStreams.Out, not the buffer.
+	assert.Equal(t, "streamed-output\n", streamBuf.String(), "output must appear in ioStreams.Out")
+	assert.True(t, output.Streamed, "output.Streamed must be true in passthrough mode")
+	// data["stdout"] is empty because passthrough bypasses the capture buffer.
+	assert.Empty(t, data["stdout"], "data[stdout] should be empty in passthrough mode (not double-buffered)")
+}
+
+// TestIntegration_ActionMode_MultiWriter verifies that in action mode (non-passthrough)
+// with ioStreams.Out set, output is written to BOTH the stream and the captured buffer.
+func TestIntegration_ActionMode_MultiWriter(t *testing.T) {
+	p := NewPlugin()
+
+	var streamBuf bytes.Buffer
+	ctx := sdkprovider.WithIOStreams(context.Background(), &sdkprovider.IOStreams{
+		Out: &streamBuf,
+	})
+	ctx = sdkprovider.WithExecutionMode(ctx, sdkprovider.CapabilityAction)
+
+	output, err := p.ExecuteProvider(ctx, ProviderName, map[string]any{
+		"command": "echo multi-writer",
+	})
+	require.NoError(t, err)
+	data, ok := output.Data.(map[string]any)
+	require.True(t, ok)
+
+	// Output must appear in both places simultaneously.
+	assert.Equal(t, "multi-writer\n", streamBuf.String(), "output must stream to ioStreams.Out")
+	assert.Equal(t, "multi-writer\n", data["stdout"], "output must also be captured in data[stdout]")
+	assert.True(t, output.Streamed)
 }
