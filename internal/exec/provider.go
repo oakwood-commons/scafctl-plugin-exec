@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Masterminds/semver/v3"
 	"github.com/go-logr/logr"
@@ -34,7 +35,11 @@ const (
 	ProviderName = "exec"
 
 	// Version is the provider version.
-	Version = "2.0.0"
+	Version = "2.1.0"
+
+	// maxStderrInError is the maximum number of stderr runes to include in
+	// failOnError error messages.
+	maxStderrInError = 512
 )
 
 // Plugin implements the scafctl ProviderPlugin interface.
@@ -102,9 +107,10 @@ func (p *Plugin) GetProviderDescriptor(_ context.Context, providerName string) (
 				sdkhelper.WithDefault("auto"),
 				sdkhelper.WithExample("auto"),
 				sdkhelper.WithMaxLength(10)),
-			"raw":         sdkhelper.BoolProp("Return trimmed stdout string instead of the full result map. Only applies in resolver/transform mode; action mode always returns the full map"),
-			"passthrough": sdkhelper.BoolProp("Stream stdout/stderr directly to the user's terminal in real-time instead of capturing. Default: false"),
+			"raw":         sdkhelper.BoolProp("Return trimmed stdout string instead of the full result map. Only applies in resolver/transform mode; action mode always returns the full map. exitCode and stderr are preserved in Output.Metadata for failOnError diagnostics"),
+			"passthrough": sdkhelper.BoolProp("Stream stdout/stderr directly to the user's terminal in real-time. Stderr is also captured internally for failOnError error messages. Default: false"),
 			"echo":        sdkhelper.BoolProp("Print the resolved command to stderr before executing. Useful for debugging dynamic commands built with expr:. Default: false"),
+			"failOnError": sdkhelper.BoolProp("Return an error to the engine when the command exits with a non-zero exit code. Default: true for action capability (fail-fast), false for from/transform capabilities (allows exit code inspection)"),
 		}),
 		OutputSchemas: map[sdkprovider.Capability]*jsonschema.Schema{
 			sdkprovider.CapabilityFrom:      sdkhelper.AnyProp("Full result map (stdout, stderr, exitCode, success, command, shell) by default; trimmed stdout string when raw: true"),
@@ -122,42 +128,42 @@ func (p *Plugin) GetProviderDescriptor(_ context.Context, providerName string) (
 			{
 				Name:        "Simple command execution",
 				Description: "Execute a simple echo command \u2014 pipes and shell features work by default",
-				YAML: "name: echo-hello\nprovider: exec\ninputs:\n  command: echo \"Hello, World!\"",
+				YAML:        "name: echo-hello\nprovider: exec\ninputs:\n  command: echo \"Hello, World!\"",
 			},
 			{
 				Name:        "Command with arguments",
 				Description: "Pass explicit arguments that are automatically shell-quoted",
-				YAML: "name: echo-args\nprovider: exec\ninputs:\n  command: echo\n  args:\n    - \"Hello\"\n    - \"World\"",
+				YAML:        "name: echo-args\nprovider: exec\ninputs:\n  command: echo\n  args:\n    - \"Hello\"\n    - \"World\"",
 			},
 			{
 				Name:        "Pipeline command",
 				Description: "Use pipes, redirections, and shell features \u2014 works on all platforms",
-				YAML: "name: pipeline\nprovider: exec\ninputs:\n  command: \"echo 'hello world' | tr a-z A-Z\"",
+				YAML:        "name: pipeline\nprovider: exec\ninputs:\n  command: \"echo 'hello world' | tr a-z A-Z\"",
 			},
 			{
 				Name:        "Command with timeout",
 				Description: "Run a command with a 30 second timeout",
-				YAML: "name: curl-with-timeout\nprovider: exec\ninputs:\n  command: curl -s https://api.example.com/data\n  timeout: 30",
+				YAML:        "name: curl-with-timeout\nprovider: exec\ninputs:\n  command: curl -s https://api.example.com/data\n  timeout: 30",
 			},
 			{
 				Name:        "Command with custom environment",
 				Description: "Execute a script with custom environment variables and working directory",
-				YAML: "name: custom-env-script\nprovider: exec\ninputs:\n  command: ./build.sh\n  workingDir: /project/src\n  env:\n    BUILD_ENV: production\n    VERSION: \"1.0.0\"",
+				YAML:        "name: custom-env-script\nprovider: exec\ninputs:\n  command: ./build.sh\n  workingDir: /project/src\n  env:\n    BUILD_ENV: production\n    VERSION: \"1.0.0\"",
 			},
 			{
 				Name:        "PowerShell command",
 				Description: "Use PowerShell for Windows-specific operations",
-				YAML: "name: pwsh-example\nprovider: exec\ninputs:\n  command: \"Get-ChildItem | Select-Object Name\"\n  shell: pwsh",
+				YAML:        "name: pwsh-example\nprovider: exec\ninputs:\n  command: \"Get-ChildItem | Select-Object Name\"\n  shell: pwsh",
 			},
 			{
 				Name:        "External bash",
 				Description: "Use an external bash shell for bash-specific features",
-				YAML: "name: bash-specific\nprovider: exec\ninputs:\n  command: 'shopt -s globstar; echo **/*.go'\n  shell: bash",
+				YAML:        "name: bash-specific\nprovider: exec\ninputs:\n  command: 'shopt -s globstar; echo **/*.go'\n  shell: bash",
 			},
 			{
 				Name:        "Echo resolved command",
 				Description: "Print the resolved command to stderr before executing — useful for debugging dynamic commands",
-				YAML: "name: build\nprovider: exec\ninputs:\n  command: go build -trimpath -o dist/app .\n  echo: true\n  passthrough: true",
+				YAML:        "name: build\nprovider: exec\ninputs:\n  command: go build -trimpath -o dist/app .\n  echo: true\n  passthrough: true",
 			},
 		},
 	}, nil
@@ -211,6 +217,18 @@ func (p *Plugin) ExecuteProvider(ctx context.Context, providerName string, input
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", ProviderName, err)
 	}
+
+	// Check failOnError: if the command exited non-zero and failOnError is
+	// active, return both the output data and an error so the engine treats
+	// this execution as failed.
+	if shouldFailOnError(ctx, input) {
+		exitCode, stderrStr := extractExitInfo(output)
+		if exitCode != 0 {
+			return output, fmt.Errorf("%s: command exited with code %d%s",
+				ProviderName, exitCode, formatStderrSuffix(stderrStr))
+		}
+	}
+
 	lgr.V(1).Info("provider completed", "provider", ProviderName)
 	return output, nil
 }
@@ -241,6 +259,13 @@ func (p *Plugin) DescribeWhatIf(_ context.Context, providerName string, input ma
 	if workingDir, ok := input["workingDir"].(string); ok && workingDir != "" {
 		msg += fmt.Sprintf(" in directory: %s", workingDir)
 	}
+	if failOnError, ok := input["failOnError"].(bool); ok {
+		if failOnError {
+			msg += "; will fail on non-zero exit code"
+		} else {
+			msg += "; will NOT fail on non-zero exit code"
+		}
+	}
 	return msg, nil
 }
 
@@ -268,6 +293,9 @@ func (p *Plugin) ExecuteProviderStream(ctx context.Context, providerName string,
 		// Non-passthrough: capture and send as a single result chunk.
 		output, err := p.ExecuteProvider(ctx, providerName, inputs)
 		if err != nil {
+			if output != nil {
+				cb(sdkplugin.StreamChunk{Result: output})
+			}
 			cb(sdkplugin.StreamChunk{Error: err.Error()})
 			return nil
 		}
@@ -289,6 +317,18 @@ func (p *Plugin) ExecuteProviderStream(ctx context.Context, providerName string,
 		cb(sdkplugin.StreamChunk{Error: err.Error()})
 		return nil
 	}
+
+	// Check failOnError for passthrough streaming path.
+	if shouldFailOnError(ctx, inputs) {
+		exitCode, stderrStr := extractExitInfo(output)
+		if exitCode != 0 {
+			cb(sdkplugin.StreamChunk{Result: output})
+			cb(sdkplugin.StreamChunk{Error: fmt.Sprintf("%s: command exited with code %d%s",
+				ProviderName, exitCode, formatStderrSuffix(stderrStr))})
+			return nil
+		}
+	}
+
 	cb(sdkplugin.StreamChunk{Result: output})
 	return nil
 }
@@ -471,14 +511,14 @@ func executeCommand(ctx context.Context, command string, inputs map[string]any, 
 				stdoutWriter = ioStreams.Out
 			}
 			if ioStreams.ErrOut != nil {
-				stderrWriter = ioStreams.ErrOut
+				stderrWriter = io.MultiWriter(&stderr, ioStreams.ErrOut)
 			}
 		} else {
 			// No host-provided IO streams — stream directly to process stdout/stderr so
 			// long-running processes produce output in real-time instead of buffering
 			// until exit.
 			stdoutWriter = os.Stdout
-			stderrWriter = os.Stderr
+			stderrWriter = io.MultiWriter(&stderr, os.Stderr)
 		}
 	} else {
 		mode, _ := sdkprovider.ExecutionModeFromContext(ctx)
@@ -513,11 +553,11 @@ func executeCommand(ctx context.Context, command string, inputs map[string]any, 
 			sort.Strings(keys)
 			for _, k := range keys {
 				v := fmt.Sprint(userEnv[k])
-			if strings.ContainsAny(v, " \t\"'\\") {
-				fmt.Fprintf(&sb, "%s=%q ", k, v)
-			} else {
-				fmt.Fprintf(&sb, "%s=%s ", k, v)
-			}
+				if strings.ContainsAny(v, " \t\"'\\") {
+					fmt.Fprintf(&sb, "%s=%q ", k, v)
+				} else {
+					fmt.Fprintf(&sb, "%s=%s ", k, v)
+				}
 			}
 		}
 		sb.WriteString(shellexec.BuildFullCommand(command, args))
@@ -563,7 +603,11 @@ func executeCommand(ctx context.Context, command string, inputs map[string]any, 
 		if mode, modeOK := sdkprovider.ExecutionModeFromContext(ctx); modeOK &&
 			(mode == sdkprovider.CapabilityFrom || mode == sdkprovider.CapabilityTransform) {
 			return &sdkprovider.Output{
-				Data:     strings.TrimSpace(stdout.String()),
+				Data: strings.TrimSpace(stdout.String()),
+				Metadata: map[string]any{
+					"exitCode": result.ExitCode,
+					"stderr":   stderr.String(),
+				},
 				Streamed: streamed,
 			}, nil
 		}
@@ -622,4 +666,58 @@ func resolvePath(ctx context.Context, path string) (string, error) {
 	}
 
 	return filepath.Clean(filepath.Join(base, path)), nil
+}
+
+// shouldFailOnError determines whether the provider should return an error for
+// non-zero exit codes. If the user explicitly sets failOnError, that takes
+// precedence. Otherwise the default depends on the execution mode: true for
+// action capability (fail-fast), false for from/transform (exit code inspection).
+func shouldFailOnError(ctx context.Context, inputs map[string]any) bool {
+	if explicit, ok := inputs["failOnError"].(bool); ok {
+		return explicit
+	}
+	mode, ok := sdkprovider.ExecutionModeFromContext(ctx)
+	if !ok {
+		return false
+	}
+	return mode == sdkprovider.CapabilityAction
+}
+
+// extractExitInfo reads the exit code and stderr from a provider output.
+// It checks Data (map[string]any) first, then falls back to Metadata
+// (used when raw: true returns Data as a string).
+func extractExitInfo(output *sdkprovider.Output) (int, string) {
+	if output == nil {
+		return 0, ""
+	}
+	if data, ok := output.Data.(map[string]any); ok {
+		exitCode, _ := data["exitCode"].(int)
+		stderrStr, _ := data["stderr"].(string)
+		return exitCode, stderrStr
+	}
+	if output.Metadata != nil {
+		exitCode, _ := output.Metadata["exitCode"].(int)
+		stderrStr, _ := output.Metadata["stderr"].(string)
+		return exitCode, stderrStr
+	}
+	return 0, ""
+}
+
+// formatStderrSuffix returns a suffix string containing truncated stderr for
+// inclusion in error messages. Returns empty string if stderr is empty.
+// Truncation is rune-aware to avoid splitting multi-byte UTF-8 characters.
+func formatStderrSuffix(stderr string) string {
+	stderr = strings.TrimSpace(stderr)
+	if stderr == "" {
+		return ""
+	}
+	if utf8.RuneCountInString(stderr) > maxStderrInError {
+		var byteIdx int
+		for i := 0; i < maxStderrInError; i++ {
+			_, size := utf8.DecodeRuneInString(stderr[byteIdx:])
+			byteIdx += size
+		}
+		stderr = stderr[:byteIdx] + "..."
+	}
+	return ": " + stderr
 }
