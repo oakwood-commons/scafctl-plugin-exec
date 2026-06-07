@@ -608,7 +608,6 @@ func TestExecuteProviderStream_UnknownProvider_SendsErrorChunk(t *testing.T) {
 	assert.Contains(t, errChunk, "unknown provider")
 }
 
-
 func TestExecuteProviderStream_NilInputs_NoError(t *testing.T) {
 	p := NewPlugin()
 	var errChunk string
@@ -802,6 +801,8 @@ func TestExecuteProvider_Passthrough_NoIOStreams_UsesOsStreams(t *testing.T) {
 	})
 
 	// No IOStreams in context — passthrough should fall back to os.Stdout/os.Stderr.
+	// Stderr is wrapped in a MultiWriter to capture it for failOnError diagnostics,
+	// so we verify stdout is os.Stdout and stderr contains os.Stderr.
 	ctx := shellexec.WithRunFunc(context.Background(), mockFn)
 
 	output, err := p.ExecuteProvider(ctx, ProviderName, map[string]any{
@@ -810,7 +811,8 @@ func TestExecuteProvider_Passthrough_NoIOStreams_UsesOsStreams(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Equal(t, os.Stdout, capturedStdout)
-	assert.Equal(t, os.Stderr, capturedStderr)
+	assert.NotNil(t, capturedStderr, "stderr writer should be set")
+	assert.NotEqual(t, capturedStderr, os.Stderr, "stderr should be wrapped in MultiWriter for capture")
 	assert.True(t, output.Streamed)
 }
 
@@ -922,4 +924,341 @@ func TestIntegration_ActionMode_MultiWriter(t *testing.T) {
 	assert.Equal(t, "multi-writer\n", streamBuf.String(), "output must stream to ioStreams.Out")
 	assert.Equal(t, "multi-writer\n", data["stdout"], "output must also be captured in data[stdout]")
 	assert.True(t, output.Streamed)
+}
+
+// ---------------------------------------------------------------------------
+// failOnError tests
+// ---------------------------------------------------------------------------
+
+func TestExecuteProvider_FailOnError_ActionMode_NonZeroExitReturnsError(t *testing.T) {
+	p := NewPlugin()
+	ctx := sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityAction)
+
+	output, err := p.ExecuteProvider(ctx, ProviderName, map[string]any{
+		"command": "echo fail-msg >&2; exit 3",
+	})
+	// Action mode defaults to failOnError=true, so non-zero exit returns an error.
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "command exited with code 3")
+	assert.Contains(t, err.Error(), "fail-msg")
+
+	// The output should still be populated for inspection.
+	require.NotNil(t, output)
+	data, ok := output.Data.(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, 3, data["exitCode"])
+	assert.Equal(t, false, data["success"])
+}
+
+func TestExecuteProvider_FailOnError_ActionMode_ZeroExitSucceeds(t *testing.T) {
+	p := NewPlugin()
+	ctx := sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityAction)
+
+	output, err := p.ExecuteProvider(ctx, ProviderName, map[string]any{
+		"command": "echo ok",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, output)
+
+	data, ok := output.Data.(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, 0, data["exitCode"])
+	assert.Equal(t, true, data["success"])
+}
+
+func TestExecuteProvider_FailOnError_FromMode_NonZeroExitNoError(t *testing.T) {
+	p := NewPlugin()
+	ctx := sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityFrom)
+
+	output, err := p.ExecuteProvider(ctx, ProviderName, map[string]any{
+		"command": "exit 1",
+	})
+	// From mode defaults to failOnError=false, so non-zero exit does NOT return an error.
+	require.NoError(t, err)
+	require.NotNil(t, output)
+
+	data, ok := output.Data.(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, 1, data["exitCode"])
+	assert.Equal(t, false, data["success"])
+}
+
+func TestExecuteProvider_FailOnError_TransformMode_NonZeroExitNoError(t *testing.T) {
+	p := NewPlugin()
+	ctx := sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityTransform)
+
+	output, err := p.ExecuteProvider(ctx, ProviderName, map[string]any{
+		"command": "exit 2",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, output)
+
+	data, ok := output.Data.(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, 2, data["exitCode"])
+	assert.Equal(t, false, data["success"])
+}
+
+func TestExecuteProvider_FailOnError_ExplicitTrue_FromMode(t *testing.T) {
+	p := NewPlugin()
+	// From mode with explicit failOnError=true should fail.
+	ctx := sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityFrom)
+
+	output, err := p.ExecuteProvider(ctx, ProviderName, map[string]any{
+		"command":     "exit 5",
+		"failOnError": true,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "command exited with code 5")
+	require.NotNil(t, output)
+}
+
+func TestExecuteProvider_FailOnError_ExplicitFalse_ActionMode(t *testing.T) {
+	p := NewPlugin()
+	// Action mode with explicit failOnError=false should NOT fail.
+	ctx := sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityAction)
+
+	output, err := p.ExecuteProvider(ctx, ProviderName, map[string]any{
+		"command":     "exit 1",
+		"failOnError": false,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, output)
+
+	data, ok := output.Data.(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, 1, data["exitCode"])
+	assert.Equal(t, false, data["success"])
+}
+
+func TestExecuteProvider_FailOnError_NoMode_NonZeroExitNoError(t *testing.T) {
+	p := NewPlugin()
+	// No execution mode in context — should default to no failure.
+	output, err := p.ExecuteProvider(context.Background(), ProviderName, map[string]any{
+		"command": "exit 1",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, output)
+}
+
+func TestExecuteProvider_FailOnError_EmptyStderr(t *testing.T) {
+	p := NewPlugin()
+	ctx := sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityAction)
+
+	_, err := p.ExecuteProvider(ctx, ProviderName, map[string]any{
+		"command": "exit 1",
+	})
+	require.Error(t, err)
+	// Error should mention exit code but not have a trailing colon for empty stderr.
+	assert.Contains(t, err.Error(), "command exited with code 1")
+	assert.NotContains(t, err.Error(), ": : ")
+}
+
+func TestDescribeWhatIf_FailOnError(t *testing.T) {
+	p := NewPlugin()
+
+	desc, err := p.DescribeWhatIf(context.Background(), ProviderName, map[string]any{
+		"command":     "echo hello",
+		"failOnError": true,
+	})
+	require.NoError(t, err)
+	assert.Contains(t, desc, "will fail on non-zero exit code")
+
+	desc, err = p.DescribeWhatIf(context.Background(), ProviderName, map[string]any{
+		"command":     "echo hello",
+		"failOnError": false,
+	})
+	require.NoError(t, err)
+	assert.Contains(t, desc, "will NOT fail on non-zero exit code")
+}
+
+func TestFormatStderrSuffix(t *testing.T) {
+	assert.Equal(t, "", formatStderrSuffix(""))
+	assert.Equal(t, "", formatStderrSuffix("   "))
+	assert.Equal(t, ": something broke", formatStderrSuffix("something broke"))
+	assert.Equal(t, ": short msg", formatStderrSuffix("  short msg  "))
+
+	longStderr := strings.Repeat("x", 600)
+	result := formatStderrSuffix(longStderr)
+	assert.True(t, strings.HasSuffix(result, "..."))
+	assert.LessOrEqual(t, len(result), maxStderrInError+10) // ": " + content + "..."
+}
+
+func TestShouldFailOnError(t *testing.T) {
+	tests := []struct {
+		name     string
+		ctx      context.Context
+		inputs   map[string]any
+		expected bool
+	}{
+		{
+			name:     "explicit true overrides mode",
+			ctx:      sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityFrom),
+			inputs:   map[string]any{"failOnError": true},
+			expected: true,
+		},
+		{
+			name:     "explicit false overrides action mode",
+			ctx:      sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityAction),
+			inputs:   map[string]any{"failOnError": false},
+			expected: false,
+		},
+		{
+			name:     "action mode defaults true",
+			ctx:      sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityAction),
+			inputs:   map[string]any{},
+			expected: true,
+		},
+		{
+			name:     "from mode defaults false",
+			ctx:      sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityFrom),
+			inputs:   map[string]any{},
+			expected: false,
+		},
+		{
+			name:     "transform mode defaults false",
+			ctx:      sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityTransform),
+			inputs:   map[string]any{},
+			expected: false,
+		},
+		{
+			name:     "no mode defaults false",
+			ctx:      context.Background(),
+			inputs:   map[string]any{},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, shouldFailOnError(tt.ctx, tt.inputs))
+		})
+	}
+}
+
+func TestExecuteProviderStream_FailOnError_ActionMode(t *testing.T) {
+	p := NewPlugin()
+	ctx := sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityAction)
+
+	var chunks []sdkplugin.StreamChunk
+	err := p.ExecuteProviderStream(ctx, ProviderName, map[string]any{
+		"command": "echo fail-msg >&2; exit 1",
+	}, func(c sdkplugin.StreamChunk) {
+		chunks = append(chunks, c)
+	})
+	require.NoError(t, err) // stream method returns nil; error goes via chunk
+
+	// Non-passthrough streaming should send both a result chunk (with output
+	// data for inspection) and an error chunk.
+	var gotError, gotResult bool
+	for _, c := range chunks {
+		if c.Error != "" {
+			gotError = true
+			assert.Contains(t, c.Error, "command exited with code 1")
+		}
+		if c.Result != nil {
+			gotResult = true
+		}
+	}
+	assert.True(t, gotError, "expected an error chunk for non-zero exit in action mode")
+	assert.True(t, gotResult, "expected a result chunk preserving output data")
+}
+
+func TestExecuteProvider_FailOnError_RawMode_ExplicitTrue(t *testing.T) {
+	p := NewPlugin()
+	ctx := sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityFrom)
+
+	output, err := p.ExecuteProvider(ctx, ProviderName, map[string]any{
+		"command":     "echo raw-stderr >&2; exit 4",
+		"raw":         true,
+		"failOnError": true,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "command exited with code 4")
+	assert.Contains(t, err.Error(), "raw-stderr")
+
+	require.NotNil(t, output)
+	_, isString := output.Data.(string)
+	assert.True(t, isString, "raw mode should return Data as string")
+	require.NotNil(t, output.Metadata)
+	assert.Equal(t, 4, output.Metadata["exitCode"])
+}
+
+func TestExecuteProvider_FailOnError_RawMode_DefaultFromNoError(t *testing.T) {
+	p := NewPlugin()
+	ctx := sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityFrom)
+
+	output, err := p.ExecuteProvider(ctx, ProviderName, map[string]any{
+		"command": "exit 1",
+		"raw":     true,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, output)
+}
+
+func TestExecuteProviderStream_FailOnError_Passthrough_ActionMode(t *testing.T) {
+	p := NewPlugin()
+	ctx := sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityAction)
+
+	var chunks []sdkplugin.StreamChunk
+	err := p.ExecuteProviderStream(ctx, ProviderName, map[string]any{
+		"command":     "echo pt-fail >&2; exit 2",
+		"passthrough": true,
+	}, func(c sdkplugin.StreamChunk) {
+		chunks = append(chunks, c)
+	})
+	require.NoError(t, err)
+
+	var gotError, gotResult bool
+	for _, c := range chunks {
+		if c.Error != "" {
+			gotError = true
+			assert.Contains(t, c.Error, "command exited with code 2")
+			assert.Contains(t, c.Error, "pt-fail", "passthrough stderr should be captured in error message")
+		}
+		if c.Result != nil {
+			gotResult = true
+		}
+	}
+	assert.True(t, gotError, "expected an error chunk for passthrough + failOnError")
+	assert.True(t, gotResult, "expected a result chunk preserving output data")
+}
+
+func TestExtractExitInfo(t *testing.T) {
+	tests := []struct {
+		name       string
+		output     *sdkprovider.Output
+		wantCode   int
+		wantStderr string
+	}{
+		{
+			name:     "nil output",
+			output:   nil,
+			wantCode: 0,
+		},
+		{
+			name:       "map data with exit code",
+			output:     &sdkprovider.Output{Data: map[string]any{"exitCode": 42, "stderr": "boom"}},
+			wantCode:   42,
+			wantStderr: "boom",
+		},
+		{
+			name:       "string data with metadata fallback",
+			output:     &sdkprovider.Output{Data: "raw output", Metadata: map[string]any{"exitCode": 7, "stderr": "meta-err"}},
+			wantCode:   7,
+			wantStderr: "meta-err",
+		},
+		{
+			name:     "string data without metadata",
+			output:   &sdkprovider.Output{Data: "raw output"},
+			wantCode: 0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			code, stderr := extractExitInfo(tt.output)
+			assert.Equal(t, tt.wantCode, code)
+			assert.Equal(t, tt.wantStderr, stderr)
+		})
+	}
 }
