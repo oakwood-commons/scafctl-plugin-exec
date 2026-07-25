@@ -4,9 +4,9 @@ go 1.26.4
 
 require (
 	github.com/Masterminds/semver/v3 v3.5.0
-	github.com/go-logr/logr v1.4.3
+	github.com/go-logr/logr v1.4.4
 	github.com/google/jsonschema-go v0.4.3
-	github.com/oakwood-commons/scafctl-plugin-sdk v0.9.0
+	github.com/oakwood-commons/scafctl-plugin-sdk v0.16.0
 	github.com/stretchr/testify v1.11.1
 	mvdan.cc/sh/moreinterp v0.0.0-20260208152214-f980f5eeab64
 	mvdan.cc/sh/v3 v3.13.1
