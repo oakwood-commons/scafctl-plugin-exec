@@ -9,7 +9,7 @@ require (
 	github.com/oakwood-commons/scafctl-plugin-sdk v0.17.0
 	github.com/stretchr/testify v1.12.1
 	mvdan.cc/sh/moreinterp v0.0.0-20260208152214-f980f5eeab64
-	mvdan.cc/sh/v3 v3.14.0
+	mvdan.cc/sh/v3 v3.14.1
 )
 
 require (
