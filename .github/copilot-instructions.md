@@ -1,5 +1,9 @@
 # scafctl-plugin-exec - AI Agent Instructions
 
+<!-- copilot-review:start -->
+For pull request code review, follow the review contract in [`REVIEW.md`](../REVIEW.md) at the repo root. It is the single source of truth; do not duplicate it here.
+<!-- copilot-review:end -->
+
 ## Overview
 
 This repository contains the **exec** provider plugin for scafctl. It may be extended with additional providers or capabilities.
