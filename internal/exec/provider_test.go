@@ -6,6 +6,8 @@ package exec
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"strings"
@@ -31,9 +33,11 @@ func TestGetProviderDescriptor(t *testing.T) {
 	p := NewPlugin()
 	d, err := p.GetProviderDescriptor(context.Background(), ProviderName)
 	require.NoError(t, err)
+	require.NoError(t, sdkprovider.ValidateDescriptor(d))
 	assert.Equal(t, ProviderName, d.Name)
 	assert.Equal(t, "Exec Provider", d.DisplayName)
 	assert.Equal(t, "v1", d.APIVersion)
+	assert.Equal(t, "3.0.0", d.Version.String())
 	assert.NotNil(t, d.Schema)
 	assert.Contains(t, d.Capabilities, sdkprovider.CapabilityAction)
 	assert.Contains(t, d.Capabilities, sdkprovider.CapabilityFrom)
@@ -41,6 +45,15 @@ func TestGetProviderDescriptor(t *testing.T) {
 	assert.Contains(t, d.Schema.Required, "command")
 	assert.NotEmpty(t, d.Examples)
 	assert.NotNil(t, d.OutputSchemas[sdkprovider.CapabilityAction])
+
+	failOnErrorProp := d.Schema.Properties["failOnError"]
+	require.NotNil(t, failOnErrorProp)
+	assert.Equal(t, json.RawMessage("true"), failOnErrorProp.Default)
+
+	passthroughProp := d.Schema.Properties["passthrough"]
+	require.NotNil(t, passthroughProp)
+	assert.Empty(t, passthroughProp.Default)
+	assert.Contains(t, passthroughProp.Description, "action")
 }
 
 func TestGetProviderDescriptor_UnknownProvider(t *testing.T) {
@@ -149,7 +162,9 @@ func TestExecuteProvider_NonZeroExitCode(t *testing.T) {
 	}
 
 	output, err := p.ExecuteProvider(context.Background(), ProviderName, inputs)
-	require.NoError(t, err)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "command exited with code 42")
+	require.NotNil(t, output)
 
 	data, ok := output.Data.(map[string]any)
 	require.True(t, ok)
@@ -253,11 +268,16 @@ func TestExecuteProvider_WithTimeout(t *testing.T) {
 	}
 
 	output, err := p.ExecuteProvider(context.Background(), ProviderName, inputs)
+	require.Error(t, err)
 
-	if err != nil {
-		t.Logf("Got error as expected: %v", err)
-	} else {
-		require.NotNil(t, output)
+	errStr := err.Error()
+	assert.True(t,
+		strings.Contains(errStr, "context") ||
+			strings.Contains(errStr, "signal") ||
+			strings.Contains(errStr, "command exited with code"),
+		"Expected timeout/signal/exit-code error, got: %s", errStr)
+
+	if output != nil {
 		data, ok := output.Data.(map[string]any)
 		require.True(t, ok)
 		exitCode := data["exitCode"].(int)
@@ -271,7 +291,8 @@ func TestExecuteProvider_CommandNotFound(t *testing.T) {
 	output, err := p.ExecuteProvider(context.Background(), ProviderName, map[string]any{
 		"command": "nonexistentcommand12345",
 	})
-	require.NoError(t, err)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "command exited with code 127")
 	require.NotNil(t, output)
 
 	data, ok := output.Data.(map[string]any)
@@ -407,12 +428,15 @@ func TestExecuteProvider_ContextCancellation(t *testing.T) {
 	output, err := p.ExecuteProvider(ctx, ProviderName, inputs)
 	elapsed := time.Since(start)
 
-	if err != nil {
-		errStr := err.Error()
-		assert.True(t, strings.Contains(errStr, "context") || strings.Contains(errStr, "signal"),
-			"Expected context or signal error, got: %s", errStr)
-	} else {
-		require.NotNil(t, output)
+	require.Error(t, err)
+	errStr := err.Error()
+	assert.True(t,
+		strings.Contains(errStr, "context") ||
+			strings.Contains(errStr, "signal") ||
+			strings.Contains(errStr, "command exited with code"),
+		"Expected context, signal, or non-zero exit error, got: %s", errStr)
+
+	if output != nil {
 		data, ok := output.Data.(map[string]any)
 		require.True(t, ok)
 		exitCode := data["exitCode"].(int)
@@ -506,9 +530,10 @@ func TestExecuteProvider_Passthrough(t *testing.T) {
 
 	data, ok := output.Data.(map[string]any)
 	require.True(t, ok)
-	assert.Empty(t, data["stdout"], "passthrough should not capture stdout")
+	assert.Equal(t, "passthrough-test\n", data["stdout"], "passthrough should still capture stdout in result")
 	assert.Equal(t, 0, data["exitCode"])
 	assert.Equal(t, true, data["success"])
+	assert.True(t, output.Streamed)
 
 	assert.Contains(t, termOut.String(), "passthrough-test")
 }
@@ -800,9 +825,9 @@ func TestExecuteProvider_Passthrough_NoIOStreams_UsesOsStreams(t *testing.T) {
 		return &shellexec.RunResult{ExitCode: 0, Shell: shellexec.ShellAuto}, nil
 	})
 
-	// No IOStreams in context — passthrough should fall back to os.Stdout/os.Stderr.
-	// Stderr is wrapped in a MultiWriter to capture it for failOnError diagnostics,
-	// so we verify stdout is os.Stdout and stderr contains os.Stderr.
+	// No IOStreams in context -- passthrough wraps os.Stdout and os.Stderr in
+	// synchronized capture writers so output streams in real-time while remaining
+	// captured in Result.Data.
 	ctx := shellexec.WithRunFunc(context.Background(), mockFn)
 
 	output, err := p.ExecuteProvider(ctx, ProviderName, map[string]any{
@@ -810,9 +835,10 @@ func TestExecuteProvider_Passthrough_NoIOStreams_UsesOsStreams(t *testing.T) {
 		"passthrough": true,
 	})
 	require.NoError(t, err)
-	assert.Equal(t, os.Stdout, capturedStdout)
+	assert.NotNil(t, capturedStdout, "stdout writer should be set")
+	assert.NotEqual(t, capturedStdout, os.Stdout, "stdout should be wrapped in captureWriter")
 	assert.NotNil(t, capturedStderr, "stderr writer should be set")
-	assert.NotEqual(t, capturedStderr, os.Stderr, "stderr should be wrapped in MultiWriter for capture")
+	assert.NotEqual(t, capturedStderr, os.Stderr, "stderr should be wrapped in captureWriter")
 	assert.True(t, output.Streamed)
 }
 
@@ -895,11 +921,10 @@ func TestIntegration_Passthrough_StreamsToIOStreams(t *testing.T) {
 	data, ok := output.Data.(map[string]any)
 	require.True(t, ok)
 
-	// In passthrough mode the command output goes to ioStreams.Out, not the buffer.
+	// In passthrough mode the command output goes to ioStreams.Out AND is captured in data["stdout"].
 	assert.Equal(t, "streamed-output\n", streamBuf.String(), "output must appear in ioStreams.Out")
 	assert.True(t, output.Streamed, "output.Streamed must be true in passthrough mode")
-	// data["stdout"] is empty because passthrough bypasses the capture buffer.
-	assert.Empty(t, data["stdout"], "data[stdout] should be empty in passthrough mode (not double-buffered)")
+	assert.Equal(t, "streamed-output\n", data["stdout"], "data[stdout] should remain captured alongside streaming")
 }
 
 // TestIntegration_ActionMode_MultiWriter verifies that in action mode (non-passthrough)
@@ -927,27 +952,196 @@ func TestIntegration_ActionMode_MultiWriter(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// failOnError tests
+// failOnError and streaming mode tests
 // ---------------------------------------------------------------------------
 
-func TestExecuteProvider_FailOnError_ActionMode_NonZeroExitReturnsError(t *testing.T) {
+func TestExecuteProvider_FailOnError_DefaultTrue_AllModes(t *testing.T) {
 	p := NewPlugin()
-	ctx := sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityAction)
 
-	output, err := p.ExecuteProvider(ctx, ProviderName, map[string]any{
-		"command": "echo fail-msg >&2; exit 3",
+	modes := []struct {
+		name string
+		ctx  context.Context
+		raw  bool
+	}{
+		{
+			name: "action mode",
+			ctx:  sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityAction),
+		},
+		{
+			name: "from mode",
+			ctx:  sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityFrom),
+		},
+		{
+			name: "from mode with raw true",
+			ctx:  sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityFrom),
+			raw:  true,
+		},
+		{
+			name: "transform mode",
+			ctx:  sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityTransform),
+		},
+		{
+			name: "transform mode with raw true",
+			ctx:  sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityTransform),
+			raw:  true,
+		},
+		{
+			name: "unset mode",
+			ctx:  context.Background(),
+		},
+	}
+
+	for _, tc := range modes {
+		t.Run(tc.name, func(t *testing.T) {
+			inputs := map[string]any{
+				"command": "echo fail-msg >&2; exit 3",
+			}
+			if tc.raw {
+				inputs["raw"] = true
+			}
+
+			output, err := p.ExecuteProvider(tc.ctx, ProviderName, inputs)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "command exited with code 3")
+			assert.Contains(t, err.Error(), "fail-msg")
+			require.NotNil(t, output)
+
+			if tc.raw {
+				_, isString := output.Data.(string)
+				assert.True(t, isString, "raw mode should return Data as string")
+				require.NotNil(t, output.Metadata)
+				assert.Equal(t, 3, output.Metadata["exitCode"])
+			} else {
+				data, ok := output.Data.(map[string]any)
+				require.True(t, ok)
+				assert.Equal(t, 3, data["exitCode"])
+				assert.Equal(t, false, data["success"])
+			}
+		})
+	}
+}
+
+func TestExecuteProvider_FailOnError_ExplicitFalse_OptOut(t *testing.T) {
+	p := NewPlugin()
+
+	modes := []struct {
+		name string
+		ctx  context.Context
+	}{
+		{
+			name: "action mode",
+			ctx:  sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityAction),
+		},
+		{
+			name: "from mode",
+			ctx:  sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityFrom),
+		},
+		{
+			name: "transform mode",
+			ctx:  sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityTransform),
+		},
+		{
+			name: "unset mode",
+			ctx:  context.Background(),
+		},
+	}
+
+	for _, tc := range modes {
+		t.Run(tc.name, func(t *testing.T) {
+			output, err := p.ExecuteProvider(tc.ctx, ProviderName, map[string]any{
+				"command":     "echo partial-out; exit 5",
+				"failOnError": false,
+			})
+			require.NoError(t, err)
+			require.NotNil(t, output)
+
+			data, ok := output.Data.(map[string]any)
+			require.True(t, ok)
+			assert.Equal(t, "partial-out\n", data["stdout"])
+			assert.Equal(t, 5, data["exitCode"])
+			assert.Equal(t, false, data["success"])
+		})
+	}
+}
+
+func TestExecuteProvider_RawTrue_WithExplicitFailOnErrorFalse_Rejected(t *testing.T) {
+	p := NewPlugin()
+
+	tests := []struct {
+		name       string
+		ctx        context.Context
+		wantErr    bool
+		errContain string
+	}{
+		{
+			name:       "from mode rejects raw true + failOnError false",
+			ctx:        sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityFrom),
+			wantErr:    true,
+			errContain: "raw: true cannot be combined with failOnError: false in from mode",
+		},
+		{
+			name:       "transform mode rejects raw true + failOnError false",
+			ctx:        sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityTransform),
+			wantErr:    true,
+			errContain: "raw: true cannot be combined with failOnError: false in transform mode",
+		},
+		{
+			name:    "action mode allows raw true + failOnError false because full map is returned",
+			ctx:     sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityAction),
+			wantErr: false,
+		},
+		{
+			name:    "unset mode allows raw true + failOnError false because full map is returned",
+			ctx:     context.Background(),
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			executed := false
+			mockFn := shellexec.RunFunc(func(_ context.Context, _ *shellexec.RunOptions) (*shellexec.RunResult, error) {
+				executed = true
+				return &shellexec.RunResult{ExitCode: 0, Shell: shellexec.ShellAuto}, nil
+			})
+			ctx := shellexec.WithRunFunc(tt.ctx, mockFn)
+
+			output, err := p.ExecuteProvider(ctx, ProviderName, map[string]any{
+				"command":     "echo hello",
+				"raw":         true,
+				"failOnError": false,
+			})
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.errContain)
+				assert.Nil(t, output)
+				assert.False(t, executed, "command must not execute when inputs are invalid")
+			} else {
+				require.NoError(t, err)
+				require.NotNil(t, output)
+				assert.True(t, executed)
+			}
+		})
+	}
+}
+
+func TestExecuteProviderStream_RawTrue_WithExplicitFailOnErrorFalse_Rejected(t *testing.T) {
+	p := NewPlugin()
+	ctx := sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityFrom)
+
+	var errChunk string
+	err := p.ExecuteProviderStream(ctx, ProviderName, map[string]any{
+		"command":     "echo hello",
+		"raw":         true,
+		"failOnError": false,
+		"passthrough": true,
+	}, func(c sdkplugin.StreamChunk) {
+		if c.Error != "" {
+			errChunk = c.Error
+		}
 	})
-	// Action mode defaults to failOnError=true, so non-zero exit returns an error.
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "command exited with code 3")
-	assert.Contains(t, err.Error(), "fail-msg")
-
-	// The output should still be populated for inspection.
-	require.NotNil(t, output)
-	data, ok := output.Data.(map[string]any)
-	require.True(t, ok)
-	assert.Equal(t, 3, data["exitCode"])
-	assert.Equal(t, false, data["success"])
+	require.NoError(t, err)
+	assert.Contains(t, errChunk, "raw: true cannot be combined with failOnError: false in from mode")
 }
 
 func TestExecuteProvider_FailOnError_ActionMode_ZeroExitSucceeds(t *testing.T) {
@@ -964,81 +1158,6 @@ func TestExecuteProvider_FailOnError_ActionMode_ZeroExitSucceeds(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, 0, data["exitCode"])
 	assert.Equal(t, true, data["success"])
-}
-
-func TestExecuteProvider_FailOnError_FromMode_NonZeroExitNoError(t *testing.T) {
-	p := NewPlugin()
-	ctx := sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityFrom)
-
-	output, err := p.ExecuteProvider(ctx, ProviderName, map[string]any{
-		"command": "exit 1",
-	})
-	// From mode defaults to failOnError=false, so non-zero exit does NOT return an error.
-	require.NoError(t, err)
-	require.NotNil(t, output)
-
-	data, ok := output.Data.(map[string]any)
-	require.True(t, ok)
-	assert.Equal(t, 1, data["exitCode"])
-	assert.Equal(t, false, data["success"])
-}
-
-func TestExecuteProvider_FailOnError_TransformMode_NonZeroExitNoError(t *testing.T) {
-	p := NewPlugin()
-	ctx := sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityTransform)
-
-	output, err := p.ExecuteProvider(ctx, ProviderName, map[string]any{
-		"command": "exit 2",
-	})
-	require.NoError(t, err)
-	require.NotNil(t, output)
-
-	data, ok := output.Data.(map[string]any)
-	require.True(t, ok)
-	assert.Equal(t, 2, data["exitCode"])
-	assert.Equal(t, false, data["success"])
-}
-
-func TestExecuteProvider_FailOnError_ExplicitTrue_FromMode(t *testing.T) {
-	p := NewPlugin()
-	// From mode with explicit failOnError=true should fail.
-	ctx := sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityFrom)
-
-	output, err := p.ExecuteProvider(ctx, ProviderName, map[string]any{
-		"command":     "exit 5",
-		"failOnError": true,
-	})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "command exited with code 5")
-	require.NotNil(t, output)
-}
-
-func TestExecuteProvider_FailOnError_ExplicitFalse_ActionMode(t *testing.T) {
-	p := NewPlugin()
-	// Action mode with explicit failOnError=false should NOT fail.
-	ctx := sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityAction)
-
-	output, err := p.ExecuteProvider(ctx, ProviderName, map[string]any{
-		"command":     "exit 1",
-		"failOnError": false,
-	})
-	require.NoError(t, err)
-	require.NotNil(t, output)
-
-	data, ok := output.Data.(map[string]any)
-	require.True(t, ok)
-	assert.Equal(t, 1, data["exitCode"])
-	assert.Equal(t, false, data["success"])
-}
-
-func TestExecuteProvider_FailOnError_NoMode_NonZeroExitNoError(t *testing.T) {
-	p := NewPlugin()
-	// No execution mode in context — should default to no failure.
-	output, err := p.ExecuteProvider(context.Background(), ProviderName, map[string]any{
-		"command": "exit 1",
-	})
-	require.NoError(t, err)
-	require.NotNil(t, output)
 }
 
 func TestExecuteProvider_FailOnError_EmptyStderr(t *testing.T) {
@@ -1087,26 +1206,56 @@ func TestFormatStderrSuffix(t *testing.T) {
 func TestShouldFailOnError(t *testing.T) {
 	tests := []struct {
 		name     string
+		inputs   map[string]any
+		expected bool
+	}{
+		{
+			name:     "omitted defaults true",
+			inputs:   map[string]any{},
+			expected: true,
+		},
+		{
+			name:     "explicit true",
+			inputs:   map[string]any{"failOnError": true},
+			expected: true,
+		},
+		{
+			name:     "explicit false",
+			inputs:   map[string]any{"failOnError": false},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, shouldFailOnError(tt.inputs))
+		})
+	}
+}
+
+func TestShouldStream(t *testing.T) {
+	tests := []struct {
+		name     string
 		ctx      context.Context
 		inputs   map[string]any
 		expected bool
 	}{
 		{
-			name:     "explicit true overrides mode",
-			ctx:      sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityFrom),
-			inputs:   map[string]any{"failOnError": true},
-			expected: true,
-		},
-		{
-			name:     "explicit false overrides action mode",
-			ctx:      sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityAction),
-			inputs:   map[string]any{"failOnError": false},
-			expected: false,
-		},
-		{
 			name:     "action mode defaults true",
 			ctx:      sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityAction),
 			inputs:   map[string]any{},
+			expected: true,
+		},
+		{
+			name:     "action mode explicit passthrough false opts out",
+			ctx:      sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityAction),
+			inputs:   map[string]any{"passthrough": false},
+			expected: false,
+		},
+		{
+			name:     "action mode explicit passthrough true",
+			ctx:      sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityAction),
+			inputs:   map[string]any{"passthrough": true},
 			expected: true,
 		},
 		{
@@ -1116,84 +1265,316 @@ func TestShouldFailOnError(t *testing.T) {
 			expected: false,
 		},
 		{
+			name:     "from mode explicit passthrough true",
+			ctx:      sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityFrom),
+			inputs:   map[string]any{"passthrough": true},
+			expected: true,
+		},
+		{
 			name:     "transform mode defaults false",
 			ctx:      sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityTransform),
 			inputs:   map[string]any{},
 			expected: false,
 		},
 		{
-			name:     "no mode defaults false",
+			name:     "transform mode explicit passthrough true",
+			ctx:      sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityTransform),
+			inputs:   map[string]any{"passthrough": true},
+			expected: true,
+		},
+		{
+			name:     "unset mode defaults false",
 			ctx:      context.Background(),
 			inputs:   map[string]any{},
 			expected: false,
+		},
+		{
+			name:     "unset mode explicit passthrough true",
+			ctx:      context.Background(),
+			inputs:   map[string]any{"passthrough": true},
+			expected: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.expected, shouldFailOnError(tt.ctx, tt.inputs))
+			assert.Equal(t, tt.expected, shouldStream(tt.ctx, tt.inputs))
 		})
 	}
+}
+
+func TestExecuteProviderStream_StreamingModes(t *testing.T) {
+	p := NewPlugin()
+
+	tests := []struct {
+		name         string
+		ctx          context.Context
+		inputs       map[string]any
+		wantStreamed bool
+	}{
+		{
+			name:         "action mode streams live by default",
+			ctx:          sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityAction),
+			inputs:       map[string]any{"command": "printf 'out-line\n'; printf 'err-line\n' >&2"},
+			wantStreamed: true,
+		},
+		{
+			name:         "action mode with passthrough false buffers output",
+			ctx:          sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityAction),
+			inputs:       map[string]any{"command": "printf 'out-line\n'; printf 'err-line\n' >&2", "passthrough": false},
+			wantStreamed: false,
+		},
+		{
+			name:         "from mode buffers output by default",
+			ctx:          sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityFrom),
+			inputs:       map[string]any{"command": "printf 'out-line\n'; printf 'err-line\n' >&2"},
+			wantStreamed: false,
+		},
+		{
+			name:         "transform mode buffers output by default",
+			ctx:          sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityTransform),
+			inputs:       map[string]any{"command": "printf 'out-line\n'; printf 'err-line\n' >&2"},
+			wantStreamed: false,
+		},
+		{
+			name:         "unset mode buffers output by default",
+			ctx:          context.Background(),
+			inputs:       map[string]any{"command": "printf 'out-line\n'; printf 'err-line\n' >&2"},
+			wantStreamed: false,
+		},
+		{
+			name:         "from mode with passthrough true streams live",
+			ctx:          sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityFrom),
+			inputs:       map[string]any{"command": "printf 'out-line\n'; printf 'err-line\n' >&2", "passthrough": true},
+			wantStreamed: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdoutChunks, stderrChunks []byte
+			var resultOut *sdkprovider.Output
+			var errChunk string
+
+			err := p.ExecuteProviderStream(tt.ctx, ProviderName, tt.inputs, func(c sdkplugin.StreamChunk) {
+				stdoutChunks = append(stdoutChunks, c.Stdout...)
+				stderrChunks = append(stderrChunks, c.Stderr...)
+				if c.Result != nil {
+					resultOut = c.Result
+				}
+				if c.Error != "" {
+					errChunk = c.Error
+				}
+			})
+			require.NoError(t, err)
+			assert.Empty(t, errChunk)
+			require.NotNil(t, resultOut)
+			assert.Equal(t, tt.wantStreamed, resultOut.Streamed)
+
+			// Both stdout and stderr must always be captured in Result.Data.
+			data, ok := resultOut.Data.(map[string]any)
+			require.True(t, ok)
+			assert.Equal(t, "out-line\n", data["stdout"])
+			assert.Equal(t, "err-line\n", data["stderr"])
+
+			if tt.wantStreamed {
+				assert.Equal(t, "out-line\n", string(stdoutChunks))
+				assert.Equal(t, "err-line\n", string(stderrChunks))
+			} else {
+				assert.Empty(t, stdoutChunks)
+				assert.Empty(t, stderrChunks)
+			}
+		})
+	}
+}
+
+func TestExecuteProviderStream_ActionMode_DryRun_DoesNotExecute(t *testing.T) {
+	p := NewPlugin()
+
+	executed := false
+	mockFn := shellexec.RunFunc(func(_ context.Context, _ *shellexec.RunOptions) (*shellexec.RunResult, error) {
+		executed = true
+		return &shellexec.RunResult{ExitCode: 0, Shell: shellexec.ShellAuto}, nil
+	})
+	ctx := shellexec.WithRunFunc(context.Background(), mockFn)
+	ctx = sdkprovider.WithExecutionMode(ctx, sdkprovider.CapabilityAction)
+	ctx = sdkprovider.WithDryRun(ctx, true)
+
+	var resultOut *sdkprovider.Output
+	err := p.ExecuteProviderStream(ctx, ProviderName, map[string]any{
+		"command": "echo should-not-run",
+	}, func(c sdkplugin.StreamChunk) {
+		if c.Result != nil {
+			resultOut = c.Result
+		}
+	})
+	require.NoError(t, err)
+	assert.False(t, executed, "dry-run must not execute command in streaming action mode")
+	require.NotNil(t, resultOut)
+	assert.False(t, resultOut.Streamed)
+	data, ok := resultOut.Data.(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, true, data["_dryRun"])
+}
+
+func TestIntegration_ActionMode_PassthroughFalse_BuffersOnly(t *testing.T) {
+	p := NewPlugin()
+
+	var streamBuf bytes.Buffer
+	ctx := sdkprovider.WithIOStreams(context.Background(), &sdkprovider.IOStreams{
+		Out: &streamBuf,
+	})
+	ctx = sdkprovider.WithExecutionMode(ctx, sdkprovider.CapabilityAction)
+
+	output, err := p.ExecuteProvider(ctx, ProviderName, map[string]any{
+		"command":     "echo buffered-only",
+		"passthrough": false,
+	})
+	require.NoError(t, err)
+	data, ok := output.Data.(map[string]any)
+	require.True(t, ok)
+	assert.Empty(t, streamBuf.String(), "passthrough: false must suppress live streaming in action mode")
+	assert.Equal(t, "buffered-only\n", data["stdout"])
+	assert.False(t, output.Streamed)
 }
 
 func TestExecuteProviderStream_FailOnError_ActionMode(t *testing.T) {
 	p := NewPlugin()
 	ctx := sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityAction)
 
-	var chunks []sdkplugin.StreamChunk
-	err := p.ExecuteProviderStream(ctx, ProviderName, map[string]any{
-		"command": "echo fail-msg >&2; exit 1",
-	}, func(c sdkplugin.StreamChunk) {
-		chunks = append(chunks, c)
-	})
-	require.NoError(t, err) // stream method returns nil; error goes via chunk
-
-	// Non-passthrough streaming should send both a result chunk (with output
-	// data for inspection) and an error chunk.
+	var stdoutData, stderrData []byte
 	var gotError, gotResult bool
-	for _, c := range chunks {
+	var resultOut *sdkprovider.Output
+	err := p.ExecuteProviderStream(ctx, ProviderName, map[string]any{
+		"command": "echo visible-out; echo fail-msg >&2; exit 1",
+	}, func(c sdkplugin.StreamChunk) {
+		stdoutData = append(stdoutData, c.Stdout...)
+		stderrData = append(stderrData, c.Stderr...)
 		if c.Error != "" {
 			gotError = true
 			assert.Contains(t, c.Error, "command exited with code 1")
+			assert.Contains(t, c.Error, "fail-msg")
 		}
 		if c.Result != nil {
 			gotResult = true
+			resultOut = c.Result
 		}
-	}
+	})
+	require.NoError(t, err) // stream method returns nil; error goes via chunk
 	assert.True(t, gotError, "expected an error chunk for non-zero exit in action mode")
 	assert.True(t, gotResult, "expected a result chunk preserving output data")
+	assert.Equal(t, "visible-out\n", string(stdoutData), "action stdout must stream live before failure")
+	assert.Equal(t, "fail-msg\n", string(stderrData), "action stderr must stream live before failure")
+	require.NotNil(t, resultOut)
+	assert.True(t, resultOut.Streamed)
+	data, ok := resultOut.Data.(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "visible-out\n", data["stdout"])
+	assert.Equal(t, "fail-msg\n", data["stderr"])
 }
 
-func TestExecuteProvider_FailOnError_RawMode_ExplicitTrue(t *testing.T) {
+func TestExecuteProviderStream_FailOnError_Buffered(t *testing.T) {
 	p := NewPlugin()
-	ctx := sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityFrom)
 
-	output, err := p.ExecuteProvider(ctx, ProviderName, map[string]any{
-		"command":     "echo raw-stderr >&2; exit 4",
-		"raw":         true,
-		"failOnError": true,
-	})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "command exited with code 4")
-	assert.Contains(t, err.Error(), "raw-stderr")
+	tests := []struct {
+		name   string
+		ctx    context.Context
+		inputs map[string]any
+	}{
+		{
+			name:   "from mode buffered failure",
+			ctx:    sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityFrom),
+			inputs: map[string]any{"command": "echo buffered-out; echo buffered-err >&2; exit 2"},
+		},
+		{
+			name: "action mode with passthrough false buffered failure",
+			ctx:  sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityAction),
+			inputs: map[string]any{
+				"command":     "echo buffered-out; echo buffered-err >&2; exit 2",
+				"passthrough": false,
+			},
+		},
+	}
 
-	require.NotNil(t, output)
-	_, isString := output.Data.(string)
-	assert.True(t, isString, "raw mode should return Data as string")
-	require.NotNil(t, output.Metadata)
-	assert.Equal(t, 4, output.Metadata["exitCode"])
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var chunks []sdkplugin.StreamChunk
+			err := p.ExecuteProviderStream(tt.ctx, ProviderName, tt.inputs, func(c sdkplugin.StreamChunk) {
+				chunks = append(chunks, c)
+			})
+			require.NoError(t, err)
+
+			// Buffered failure must emit exactly 2 chunks in order: Result first, then Error,
+			// with zero live Stdout/Stderr chunks.
+			require.Len(t, chunks, 2)
+			require.NotNil(t, chunks[0].Result)
+			assert.False(t, chunks[0].Result.Streamed)
+			data, ok := chunks[0].Result.Data.(map[string]any)
+			require.True(t, ok)
+			assert.Equal(t, "buffered-out\n", data["stdout"])
+			assert.Equal(t, "buffered-err\n", data["stderr"])
+			assert.Equal(t, 2, data["exitCode"])
+
+			assert.Contains(t, chunks[1].Error, "command exited with code 2")
+			assert.Contains(t, chunks[1].Error, "buffered-err")
+		})
+	}
 }
 
-func TestExecuteProvider_FailOnError_RawMode_DefaultFromNoError(t *testing.T) {
+func TestExecuteProviderStream_Echo_StreamsToStderrChunkWithoutPollutingResult(t *testing.T) {
 	p := NewPlugin()
-	ctx := sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityFrom)
+	ctx := sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityAction)
 
-	output, err := p.ExecuteProvider(ctx, ProviderName, map[string]any{
-		"command": "exit 1",
-		"raw":     true,
+	var stdoutData, stderrData []byte
+	var resultOut *sdkprovider.Output
+	err := p.ExecuteProviderStream(ctx, ProviderName, map[string]any{
+		"command": "echo hello",
+		"echo":    true,
+	}, func(c sdkplugin.StreamChunk) {
+		stdoutData = append(stdoutData, c.Stdout...)
+		stderrData = append(stderrData, c.Stderr...)
+		if c.Result != nil {
+			resultOut = c.Result
+		}
 	})
 	require.NoError(t, err)
-	require.NotNil(t, output)
+	assert.Equal(t, "hello\n", string(stdoutData))
+	assert.Contains(t, string(stderrData), "> echo hello\n")
+	require.NotNil(t, resultOut)
+	assert.True(t, resultOut.Streamed)
+	data, ok := resultOut.Data.(map[string]any)
+	require.True(t, ok)
+	assert.Empty(t, data["stderr"], "echo prefix must not pollute captured stderr")
+}
+
+func TestExecuteProviderStream_ActionMode_FailOnErrorFalse_NoErrorChunk(t *testing.T) {
+	p := NewPlugin()
+	ctx := sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityAction)
+
+	var stdoutData []byte
+	var errChunk string
+	var resultOut *sdkprovider.Output
+	err := p.ExecuteProviderStream(ctx, ProviderName, map[string]any{
+		"command":     "echo partial; exit 7",
+		"failOnError": false,
+	}, func(c sdkplugin.StreamChunk) {
+		stdoutData = append(stdoutData, c.Stdout...)
+		if c.Error != "" {
+			errChunk = c.Error
+		}
+		if c.Result != nil {
+			resultOut = c.Result
+		}
+	})
+	require.NoError(t, err)
+	assert.Empty(t, errChunk, "failOnError: false must suppress error chunk")
+	assert.Equal(t, "partial\n", string(stdoutData))
+	require.NotNil(t, resultOut)
+	assert.True(t, resultOut.Streamed)
+	data, ok := resultOut.Data.(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, 7, data["exitCode"])
+	assert.Equal(t, false, data["success"])
 }
 
 func TestExecuteProviderStream_FailOnError_Passthrough_ActionMode(t *testing.T) {
@@ -1261,4 +1642,252 @@ func TestExtractExitInfo(t *testing.T) {
 			assert.Equal(t, tt.wantStderr, stderr)
 		})
 	}
+}
+
+type shortOrErrWriter struct {
+	n   int
+	err error
+}
+
+func (w shortOrErrWriter) Write(_ []byte) (int, error) {
+	return w.n, w.err
+}
+
+func TestCaptureWriter_ForwardErrorsAndStopForward(t *testing.T) {
+	t.Run("propagates forward write error", func(t *testing.T) {
+		wantErr := errors.New("broken stream")
+		cw := &captureWriter{forward: shortOrErrWriter{n: 2, err: wantErr}}
+		n, err := cw.Write([]byte("hello"))
+		require.ErrorIs(t, err, wantErr)
+		assert.Equal(t, 2, n)
+		assert.Equal(t, "hello", cw.String())
+	})
+
+	t.Run("returns ErrShortWrite on truncated forward write", func(t *testing.T) {
+		cw := &captureWriter{forward: shortOrErrWriter{n: 2}}
+		n, err := cw.Write([]byte("hello"))
+		require.ErrorIs(t, err, io.ErrShortWrite)
+		assert.Equal(t, 2, n)
+		assert.Equal(t, "hello", cw.String())
+	})
+
+	t.Run("StopForward detaches live stream while keeping capture working", func(t *testing.T) {
+		var live bytes.Buffer
+		cw := &captureWriter{forward: &live}
+		_, err := cw.Write([]byte("first\n"))
+		require.NoError(t, err)
+		cw.StopForward()
+		_, err = cw.Write([]byte("second\n"))
+		require.NoError(t, err)
+		assert.Equal(t, "first\n", live.String())
+		assert.Equal(t, "first\nsecond\n", cw.String())
+	})
+
+	t.Run("chunkWriter suppresses writes after closed", func(t *testing.T) {
+		closed := false
+		var got []byte
+		w := &chunkWriter{
+			cb:       func(c sdkplugin.StreamChunk) { got = append(got, c.Stdout...) },
+			isStdout: true,
+			closed:   &closed,
+		}
+		_, err := w.Write([]byte("before\n"))
+		require.NoError(t, err)
+		closed = true
+		n, err := w.Write([]byte("after\n"))
+		require.NoError(t, err)
+		assert.Equal(t, len("after\n"), n)
+		assert.Equal(t, "before\n", string(got))
+	})
+}
+
+func TestParallelSubshellJobs_NoDataRace(t *testing.T) {
+	p := NewPlugin()
+	// mvdan.cc/sh's echo builtin emits its argument and trailing newline in two
+	// separate Write calls, while printf emits each formatted string in a single
+	// Write call. Exercise both: echo verifies race-free capture/stream parity on
+	// "echo one & echo two & wait", and printf verifies atomic single-Write lines.
+	const parallelEchoCmd = "echo one & echo two & echo err-one >&2 & echo err-two >&2 & wait"
+	const parallelPrintfCmd = `printf 'one\n' & printf 'two\n' & printf 'err-one\n' >&2 & printf 'err-two\n' >&2 & wait`
+	wantStdout := []string{"one", "two"}
+	wantStderr := []string{"err-one", "err-two"}
+
+	splitLines := func(s string) []string {
+		trimmed := strings.TrimSuffix(s, "\n")
+		if trimmed == "" {
+			return nil
+		}
+		return strings.Split(trimmed, "\n")
+	}
+
+	assertEchoTokens := func(t *testing.T, out, errStr string) {
+		t.Helper()
+		assert.Contains(t, out, "one")
+		assert.Contains(t, out, "two")
+		assert.Equal(t, 2, strings.Count(out, "\n"))
+		assert.Len(t, out, len("one\ntwo\n"))
+
+		assert.Contains(t, errStr, "err-one")
+		assert.Contains(t, errStr, "err-two")
+		assert.Equal(t, 2, strings.Count(errStr, "\n"))
+		assert.Len(t, errStr, len("err-one\nerr-two\n"))
+	}
+
+	t.Run("ExecuteProviderStream in CapabilityAction", func(t *testing.T) {
+		ctx := sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityAction)
+
+		for range 10 {
+			var echoOutChunks, echoErrChunks []byte
+			var echoResult *sdkprovider.Output
+			err := p.ExecuteProviderStream(ctx, ProviderName, map[string]any{
+				"command": parallelEchoCmd,
+			}, func(c sdkplugin.StreamChunk) {
+				echoOutChunks = append(echoOutChunks, c.Stdout...)
+				echoErrChunks = append(echoErrChunks, c.Stderr...)
+				if c.Result != nil {
+					echoResult = c.Result
+				}
+				assert.Empty(t, c.Error)
+			})
+			require.NoError(t, err)
+			require.NotNil(t, echoResult)
+			assert.True(t, echoResult.Streamed)
+			echoData := echoResult.Data.(map[string]any)
+			assertEchoTokens(t, echoData["stdout"].(string), echoData["stderr"].(string))
+			assert.Equal(t, echoData["stdout"].(string), string(echoOutChunks))
+			assert.Equal(t, echoData["stderr"].(string), string(echoErrChunks))
+
+			var stdoutChunks, stderrChunks []byte
+			var resultOut *sdkprovider.Output
+			var errChunk string
+
+			err = p.ExecuteProviderStream(ctx, ProviderName, map[string]any{
+				"command": parallelPrintfCmd,
+			}, func(c sdkplugin.StreamChunk) {
+				stdoutChunks = append(stdoutChunks, c.Stdout...)
+				stderrChunks = append(stderrChunks, c.Stderr...)
+				if c.Result != nil {
+					resultOut = c.Result
+				}
+				if c.Error != "" {
+					errChunk = c.Error
+				}
+			})
+			require.NoError(t, err)
+			assert.Empty(t, errChunk)
+			require.NotNil(t, resultOut)
+			assert.True(t, resultOut.Streamed)
+
+			data, ok := resultOut.Data.(map[string]any)
+			require.True(t, ok)
+
+			capturedOut, ok := data["stdout"].(string)
+			require.True(t, ok)
+			capturedErr, ok := data["stderr"].(string)
+			require.True(t, ok)
+
+			assert.ElementsMatch(t, wantStdout, splitLines(string(stdoutChunks)))
+			assert.ElementsMatch(t, wantStderr, splitLines(string(stderrChunks)))
+			assert.ElementsMatch(t, wantStdout, splitLines(capturedOut))
+			assert.ElementsMatch(t, wantStderr, splitLines(capturedErr))
+			assert.Equal(t, capturedOut, string(stdoutChunks))
+			assert.Equal(t, capturedErr, string(stderrChunks))
+		}
+	})
+
+	t.Run("ExecuteProvider with IOStreams in CapabilityAction", func(t *testing.T) {
+		for range 10 {
+			var echoStreamOut, echoStreamErr bytes.Buffer
+			echoCtx := sdkprovider.WithIOStreams(context.Background(), &sdkprovider.IOStreams{
+				Out:    &echoStreamOut,
+				ErrOut: &echoStreamErr,
+			})
+			echoCtx = sdkprovider.WithExecutionMode(echoCtx, sdkprovider.CapabilityAction)
+			echoOutput, err := p.ExecuteProvider(echoCtx, ProviderName, map[string]any{
+				"command": parallelEchoCmd,
+			})
+			require.NoError(t, err)
+			require.NotNil(t, echoOutput)
+			assert.True(t, echoOutput.Streamed)
+			echoData := echoOutput.Data.(map[string]any)
+			assertEchoTokens(t, echoData["stdout"].(string), echoData["stderr"].(string))
+			assert.Equal(t, echoData["stdout"].(string), echoStreamOut.String())
+			assert.Equal(t, echoData["stderr"].(string), echoStreamErr.String())
+
+			var streamOut, streamErr bytes.Buffer
+			ctx := sdkprovider.WithIOStreams(context.Background(), &sdkprovider.IOStreams{
+				Out:    &streamOut,
+				ErrOut: &streamErr,
+			})
+			ctx = sdkprovider.WithExecutionMode(ctx, sdkprovider.CapabilityAction)
+
+			output, err := p.ExecuteProvider(ctx, ProviderName, map[string]any{
+				"command": parallelPrintfCmd,
+				"echo":    true,
+			})
+			require.NoError(t, err)
+			require.NotNil(t, output)
+			assert.True(t, output.Streamed)
+
+			data, ok := output.Data.(map[string]any)
+			require.True(t, ok)
+
+			capturedOut, ok := data["stdout"].(string)
+			require.True(t, ok)
+			capturedErr, ok := data["stderr"].(string)
+			require.True(t, ok)
+
+			assert.ElementsMatch(t, wantStdout, splitLines(streamOut.String()))
+			assert.ElementsMatch(t, wantStdout, splitLines(capturedOut))
+			assert.Equal(t, capturedOut, streamOut.String())
+
+			assert.ElementsMatch(t, wantStderr, splitLines(capturedErr))
+			streamErrLines := splitLines(streamErr.String())
+			require.Len(t, streamErrLines, 3)
+			assert.Equal(t, "> "+parallelPrintfCmd, streamErrLines[0])
+			assert.ElementsMatch(t, wantStderr, streamErrLines[1:])
+		}
+	})
+
+	t.Run("ExecuteProvider with shared IOStreams writer in CapabilityAction", func(t *testing.T) {
+		for range 10 {
+			var combined bytes.Buffer
+			ctx := sdkprovider.WithIOStreams(context.Background(), &sdkprovider.IOStreams{
+				Out:    &combined,
+				ErrOut: &combined,
+			})
+			ctx = sdkprovider.WithExecutionMode(ctx, sdkprovider.CapabilityAction)
+
+			output, err := p.ExecuteProvider(ctx, ProviderName, map[string]any{
+				"command": parallelPrintfCmd,
+			})
+			require.NoError(t, err)
+			require.NotNil(t, output)
+			assert.True(t, output.Streamed)
+
+			data, ok := output.Data.(map[string]any)
+			require.True(t, ok)
+			assert.ElementsMatch(t, wantStdout, splitLines(data["stdout"].(string)))
+			assert.ElementsMatch(t, wantStderr, splitLines(data["stderr"].(string)))
+			assert.ElementsMatch(t, append(append([]string{}, wantStdout...), wantStderr...), splitLines(combined.String()))
+		}
+	})
+
+	t.Run("ExecuteProvider buffered in CapabilityFrom", func(t *testing.T) {
+		ctx := sdkprovider.WithExecutionMode(context.Background(), sdkprovider.CapabilityFrom)
+
+		for range 10 {
+			output, err := p.ExecuteProvider(ctx, ProviderName, map[string]any{
+				"command": parallelPrintfCmd,
+			})
+			require.NoError(t, err)
+			require.NotNil(t, output)
+			assert.False(t, output.Streamed)
+
+			data, ok := output.Data.(map[string]any)
+			require.True(t, ok)
+			assert.ElementsMatch(t, wantStdout, splitLines(data["stdout"].(string)))
+			assert.ElementsMatch(t, wantStderr, splitLines(data["stderr"].(string)))
+		}
+	})
 }

@@ -35,7 +35,7 @@ const (
 	ProviderName = "exec"
 
 	// Version is the provider version.
-	Version = "2.1.0"
+	Version = "3.0.0"
 
 	// maxStderrInError is the maximum number of stderr runes to include in
 	// failOnError error messages.
@@ -107,10 +107,21 @@ func (p *Plugin) GetProviderDescriptor(_ context.Context, providerName string) (
 				sdkhelper.WithDefault("auto"),
 				sdkhelper.WithExample("auto"),
 				sdkhelper.WithMaxLength(10)),
-			"raw":         sdkhelper.BoolProp("Return trimmed stdout string instead of the full result map. Only applies in resolver/transform mode; action mode always returns the full map. exitCode and stderr are preserved in Output.Metadata for failOnError diagnostics"),
-			"passthrough": sdkhelper.BoolProp("Stream stdout/stderr directly to the user's terminal in real-time. Stderr is also captured internally for failOnError error messages. Default: false"),
-			"echo":        sdkhelper.BoolProp("Print the resolved command to stderr before executing. Useful for debugging dynamic commands built with expr:. Default: false"),
-			"failOnError": sdkhelper.BoolProp("Return an error to the engine when the command exits with a non-zero exit code. Default: true for action capability (fail-fast), false for from/transform capabilities (allows exit code inspection)"),
+			"raw": sdkhelper.BoolProp(
+				"Return trimmed stdout string instead of the full result map. " +
+					"Only applies in from/transform mode; action mode always returns the full map. " +
+					"Cannot be combined with failOnError: false because raw mode discards exitCode from Output.Data " +
+					"(exitCode and stderr remain in Output.Metadata for failOnError diagnostics)"),
+			"passthrough": sdkhelper.BoolProp(
+				"Stream stdout and stderr to the terminal in real-time while still capturing both in the provider output. " +
+					"Defaults to true for action capability and false for from/transform capabilities " +
+					"(set to false on an action to buffer output instead)"),
+			"echo": sdkhelper.BoolProp("Print the resolved command to stderr before executing. Useful for debugging dynamic commands built with expr:. Default: false"),
+			"failOnError": sdkhelper.BoolProp(
+				"Return an error to the engine when the command exits with a non-zero exit code. "+
+					"Set to false to inspect non-zero exit codes in the structured result map "+
+					"(cannot be combined with raw: true in from/transform mode). Default: true",
+				sdkhelper.WithDefault(true)),
 		}),
 		OutputSchemas: map[sdkprovider.Capability]*jsonschema.Schema{
 			sdkprovider.CapabilityFrom:      sdkhelper.AnyProp("Full result map (stdout, stderr, exitCode, success, command, shell) by default; trimmed stdout string when raw: true"),
@@ -127,8 +138,18 @@ func (p *Plugin) GetProviderDescriptor(_ context.Context, providerName string) (
 		Examples: []sdkprovider.Example{
 			{
 				Name:        "Simple command execution",
-				Description: "Execute a simple echo command \u2014 pipes and shell features work by default",
+				Description: "Execute a simple echo command -- pipes and shell features work by default",
 				YAML:        "name: echo-hello\nprovider: exec\ninputs:\n  command: echo \"Hello, World!\"",
+			},
+			{
+				Name:        "Raw string output",
+				Description: "Capture trimmed stdout string in a resolver -- fails fast on non-zero exit by default",
+				YAML:        "name: git-sha\nprovider: exec\ninputs:\n  command: git rev-parse --short HEAD\n  raw: true",
+			},
+			{
+				Name:        "Inspect non-zero exit code",
+				Description: "Opt into structured exit-code inspection with failOnError: false",
+				YAML:        "name: check-tool\nprovider: exec\ninputs:\n  command: which jq\n  failOnError: false",
 			},
 			{
 				Name:        "Command with arguments",
@@ -137,7 +158,7 @@ func (p *Plugin) GetProviderDescriptor(_ context.Context, providerName string) (
 			},
 			{
 				Name:        "Pipeline command",
-				Description: "Use pipes, redirections, and shell features \u2014 works on all platforms",
+				Description: "Use pipes, redirections, and shell features -- works on all platforms",
 				YAML:        "name: pipeline\nprovider: exec\ninputs:\n  command: \"echo 'hello world' | tr a-z A-Z\"",
 			},
 			{
@@ -162,8 +183,8 @@ func (p *Plugin) GetProviderDescriptor(_ context.Context, providerName string) (
 			},
 			{
 				Name:        "Echo resolved command",
-				Description: "Print the resolved command to stderr before executing — useful for debugging dynamic commands",
-				YAML:        "name: build\nprovider: exec\ninputs:\n  command: go build -trimpath -o dist/app .\n  echo: true\n  passthrough: true",
+				Description: "Print the resolved command to stderr before executing -- action output streams live by default",
+				YAML:        "name: build\nprovider: exec\ninputs:\n  command: go build -trimpath -o dist/app .\n  echo: true",
 			},
 		},
 	}, nil
@@ -184,24 +205,9 @@ func (p *Plugin) ExecuteProvider(ctx context.Context, providerName string, input
 
 	lgr := logr.FromContextOrDiscard(ctx)
 
-	command, ok := input["command"].(string)
-	if !ok || command == "" {
-		return nil, fmt.Errorf("%s: command is required and must be a non-empty string", ProviderName)
-	}
-
-	// Parse shell type.
-	shell := shellexec.ShellAuto
-	if shellRaw, ok := input["shell"]; ok && shellRaw != nil {
-		shellStr, ok := shellRaw.(string)
-		if !ok {
-			return nil, fmt.Errorf("%s: shell must be a string (one of: %s)", ProviderName,
-				strings.Join(shellexec.ValidShellTypes(), ", "))
-		}
-		shell = shellexec.ShellType(shellStr)
-		if !shell.IsValid() {
-			return nil, fmt.Errorf("%s: unsupported shell type %q, valid values: %s", ProviderName,
-				shellStr, strings.Join(shellexec.ValidShellTypes(), ", "))
-		}
+	command, shell, err := validateAndParseInputs(ctx, input)
+	if err != nil {
+		return nil, err
 	}
 
 	lgr.V(1).Info("executing provider", "provider", ProviderName, "command", command, "shell", string(shell))
@@ -213,7 +219,7 @@ func (p *Plugin) ExecuteProvider(ctx context.Context, providerName string, input
 		return output, nil
 	}
 
-	output, err := executeCommand(ctx, command, input, shell)
+	output, err := executeCommand(ctx, command, input, shell, nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", ProviderName, err)
 	}
@@ -221,7 +227,7 @@ func (p *Plugin) ExecuteProvider(ctx context.Context, providerName string, input
 	// Check failOnError: if the command exited non-zero and failOnError is
 	// active, return both the output data and an error so the engine treats
 	// this execution as failed.
-	if shouldFailOnError(ctx, input) {
+	if shouldFailOnError(input) {
 		exitCode, stderrStr := extractExitInfo(output)
 		if exitCode != 0 {
 			return output, fmt.Errorf("%s: command exited with code %d%s",
@@ -269,13 +275,14 @@ func (p *Plugin) DescribeWhatIf(_ context.Context, providerName string, input ma
 	return msg, nil
 }
 
-// ExecuteProviderStream implements real-time streaming for passthrough: true
-// commands. stdout and stderr bytes are forwarded to the host as gRPC stream
-// chunks as they are produced, so long-running and blocking processes appear
-// in the terminal immediately without waiting for the process to exit.
+// ExecuteProviderStream streams stdout and stderr chunks in real-time when live
+// streaming is active (by default for CapabilityAction unless passthrough is
+// explicitly false, and for other modes when passthrough is explicitly true).
+// Both stdout and stderr remain captured in Result.Data and Output.Streamed is
+// set to true whenever live streaming was active.
 //
-// For non-passthrough executions the full output is captured then sent as a
-// single result chunk (identical behaviour to ExecuteProvider).
+// When live streaming is inactive, the full output is captured and sent as a
+// single result chunk (identical behavior to ExecuteProvider).
 func (p *Plugin) ExecuteProviderStream(ctx context.Context, providerName string, inputs map[string]any, cb func(sdkplugin.StreamChunk)) error {
 	if cb == nil {
 		return fmt.Errorf("%s: stream callback must not be nil", ProviderName)
@@ -288,9 +295,8 @@ func (p *Plugin) ExecuteProviderStream(ctx context.Context, providerName string,
 		return nil
 	}
 
-	passthrough, _ := inputs["passthrough"].(bool)
-	if !passthrough {
-		// Non-passthrough: capture and send as a single result chunk.
+	if !shouldStream(ctx, inputs) {
+		// Buffered mode: capture and send as a single result chunk.
 		output, err := p.ExecuteProvider(ctx, providerName, inputs)
 		if err != nil {
 			if output != nil {
@@ -303,23 +309,41 @@ func (p *Plugin) ExecuteProviderStream(ctx context.Context, providerName string,
 		return nil
 	}
 
-	// Passthrough: stream stdout/stderr chunks as bytes arrive so the host
-	// can display them immediately, even if the process never exits.
-	// A shared mutex serializes concurrent writes from stdout/stderr goroutines.
-	mu := &sync.Mutex{}
-	stdoutWriter := &chunkWriter{cb: cb, isStdout: true, mu: mu}
-	stderrWriter := &chunkWriter{cb: cb, isStdout: false, mu: mu}
-	output, err := executeCommandStreamed(ctx, inputs, stdoutWriter, stderrWriter)
+	command, shell, err := validateAndParseInputs(ctx, inputs)
 	if err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
 		cb(sdkplugin.StreamChunk{Error: err.Error()})
 		return nil
 	}
 
-	// Check failOnError for passthrough streaming path.
-	if shouldFailOnError(ctx, inputs) {
+	if sdkprovider.DryRunFromContext(ctx) {
+		cb(sdkplugin.StreamChunk{Result: executeDryRun(command, inputs, shell)})
+		return nil
+	}
+
+	// Stream stdout/stderr chunks as bytes arrive so the host can display them
+	// immediately, while executeCommand also captures both streams into Result.Data.
+	// A shared mutex serializes concurrent writes across stdout, stderr, and
+	// terminal result/error chunks.
+	mu := &sync.Mutex{}
+	closed := false
+	stdoutWriter := &chunkWriter{cb: cb, isStdout: true, mu: mu, closed: &closed}
+	stderrWriter := &chunkWriter{cb: cb, isStdout: false, mu: mu, closed: &closed}
+	output, err := executeCommand(ctx, command, inputs, shell, stdoutWriter, stderrWriter)
+
+	mu.Lock()
+	defer mu.Unlock()
+	closed = true
+
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		cb(sdkplugin.StreamChunk{Error: fmt.Sprintf("%s: %v", ProviderName, err)})
+		return nil
+	}
+
+	// Check failOnError for live streaming path.
+	if shouldFailOnError(inputs) {
 		exitCode, stderrStr := extractExitInfo(output)
 		if exitCode != 0 {
 			cb(sdkplugin.StreamChunk{Result: output})
@@ -335,15 +359,17 @@ func (p *Plugin) ExecuteProviderStream(ctx context.Context, providerName string,
 
 // chunkWriter forwards writes as StreamChunk callbacks so the host receives
 // output in real-time over the gRPC server-stream. mu serializes concurrent
-// writes from stdout and stderr goroutines in the external-shell path.
+// writes across stdout, stderr, and terminal chunks; closed suppresses late
+// writes after the stream completes.
 type chunkWriter struct {
 	cb       func(sdkplugin.StreamChunk)
 	isStdout bool
 	mu       *sync.Mutex
+	closed   *bool
 }
 
 func (w *chunkWriter) Write(p []byte) (int, error) {
-	if w.cb == nil {
+	if len(p) == 0 || w.cb == nil {
 		return len(p), nil
 	}
 	chunk := make([]byte, len(p))
@@ -352,12 +378,75 @@ func (w *chunkWriter) Write(p []byte) (int, error) {
 		w.mu.Lock()
 		defer w.mu.Unlock()
 	}
+	if w.closed != nil && *w.closed {
+		return len(p), nil
+	}
 	if w.isStdout {
 		w.cb(sdkplugin.StreamChunk{Stdout: chunk})
 	} else {
 		w.cb(sdkplugin.StreamChunk{Stderr: chunk})
 	}
 	return len(p), nil
+}
+
+// captureWriter buffers all written bytes for Result.Data while optionally
+// forwarding each write to a live stream under the same mutex so concurrent
+// subshell goroutines cannot race on capture buffers or interleave stream writes.
+type captureWriter struct {
+	mu        sync.Mutex
+	buf       bytes.Buffer
+	forward   io.Writer
+	forwardMu *sync.Mutex
+}
+
+func (w *captureWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	_, _ = w.buf.Write(p)
+	if w.forward != nil {
+		if w.forwardMu != nil {
+			w.forwardMu.Lock()
+			defer w.forwardMu.Unlock()
+		}
+		n, err := w.forward.Write(p)
+		if err != nil {
+			return n, err
+		}
+		if n != len(p) {
+			return n, io.ErrShortWrite
+		}
+	}
+	return len(p), nil
+}
+
+// WriteForward writes s directly to dst under the capture and forward mutexes
+// without recording s in the capture buffer.
+func (w *captureWriter) WriteForward(dst io.Writer, s string) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.forwardMu != nil {
+		w.forwardMu.Lock()
+		defer w.forwardMu.Unlock()
+	}
+	return io.WriteString(dst, s)
+}
+
+// StopForward detaches any live forward writer once command execution finishes
+// so an un-waited background subshell cannot mutate caller-owned streams.
+func (w *captureWriter) StopForward() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.forward = nil
+}
+
+func (w *captureWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	return w.buf.String()
 }
 
 // ExtractDependencies returns resolver keys this input depends on.
@@ -374,37 +463,44 @@ func (p *Plugin) StopProvider(_ context.Context, _ string) error {
 	return nil
 }
 
-// executeCommandStreamed is like executeCommand but accepts explicit stdout/stderr
-// writers, bypassing the IOStreams-from-context logic. Used by ExecuteProviderStream
-// to inject chunk writers that forward bytes to the gRPC server stream in real-time.
-func executeCommandStreamed(ctx context.Context, inputs map[string]any, stdoutW, stderrW io.Writer) (*sdkprovider.Output, error) {
-	// Inject passthrough writers into context so executeCommand picks them up
-	// instead of building its own from IOStreams.
-	ctx = sdkprovider.WithIOStreams(ctx, &sdkprovider.IOStreams{
-		Out:    stdoutW,
-		ErrOut: stderrW,
-	})
-	// Force passthrough path so the injected streams are used directly.
-	passthroughInputs := make(map[string]any, len(inputs))
-	for k, v := range inputs {
-		passthroughInputs[k] = v
+// validateAndParseInputs validates provider inputs and resolves command and shell.
+func validateAndParseInputs(ctx context.Context, input map[string]any) (string, shellexec.ShellType, error) {
+	command, ok := input["command"].(string)
+	if !ok || command == "" {
+		return "", "", fmt.Errorf("%s: command is required and must be a non-empty string", ProviderName)
 	}
-	passthroughInputs["passthrough"] = true
 
-	shellStr, _ := inputs["shell"].(string)
-	shell := shellexec.ShellType(shellStr)
-	if shellStr != "" && !shell.IsValid() {
-		return nil, fmt.Errorf("shell %q is not supported; valid values: sh, bash, pwsh, cmd, auto", shellStr)
+	shell := shellexec.ShellAuto
+	if shellRaw, ok := input["shell"]; ok && shellRaw != nil {
+		shellStr, ok := shellRaw.(string)
+		if !ok {
+			return "", "", fmt.Errorf("%s: shell must be a string (one of: %s)", ProviderName,
+				strings.Join(shellexec.ValidShellTypes(), ", "))
+		}
+		shell = shellexec.ShellType(shellStr)
+		if !shell.IsValid() {
+			return "", "", fmt.Errorf("%s: unsupported shell type %q, valid values: %s", ProviderName,
+				shellStr, strings.Join(shellexec.ValidShellTypes(), ", "))
+		}
 	}
-	if !shell.IsValid() {
-		shell = shellexec.ShellAuto
+
+	raw, _ := input["raw"].(bool)
+	if failOnError, hasFailOnError := input["failOnError"].(bool); raw && hasFailOnError && !failOnError {
+		if mode, modeOK := sdkprovider.ExecutionModeFromContext(ctx); modeOK &&
+			(mode == sdkprovider.CapabilityFrom || mode == sdkprovider.CapabilityTransform) {
+			return "", "", fmt.Errorf(
+				"%s: raw: true cannot be combined with failOnError: false in %s mode because raw output discards exitCode",
+				ProviderName, mode)
+		}
 	}
-	command, _ := inputs["command"].(string)
-	return executeCommand(ctx, command, passthroughInputs, shell)
+
+	return command, shell, nil
 }
 
-// executeCommand runs the actual shell command.
-func executeCommand(ctx context.Context, command string, inputs map[string]any, shell shellexec.ShellType) (*sdkprovider.Output, error) {
+// executeCommand runs the actual shell command. When streamOut or streamErr are
+// non-nil (from ExecuteProviderStream), live output is tee'd to those writers
+// while still capturing stdout and stderr in fullResult.
+func executeCommand(ctx context.Context, command string, inputs map[string]any, shell shellexec.ShellType, streamOut, streamErr io.Writer) (*sdkprovider.Output, error) {
 	// Parse arguments.
 	var args []string
 	if argsRaw, ok := inputs["args"]; ok && argsRaw != nil {
@@ -497,51 +593,51 @@ func executeCommand(ctx context.Context, command string, inputs map[string]any, 
 		}
 	}
 
-	// Set up stdout/stderr writers.
-	var stdout, stderr bytes.Buffer
-	var stdoutWriter, stderrWriter io.Writer = &stdout, &stderr
+	// Set up stdout/stderr writers. Both streams are always captured into
+	// mutex-synchronized writers so Result.Data (fullResult) retains complete
+	// output without data races even when parallel subshell jobs write
+	// concurrently or live streaming is active.
+	var forwardOut, forwardErr io.Writer
 	streamed := false
-	passthrough, _ := inputs["passthrough"].(bool)
 
-	if passthrough {
-		// Passthrough mode always streams — set the flag regardless of IO source.
+	if streamOut != nil || streamErr != nil {
 		streamed = true
+		forwardOut = streamOut
+		forwardErr = streamErr
+	} else if shouldStream(ctx, inputs) {
 		if ioStreams, ok := sdkprovider.IOStreamsFromContext(ctx); ok && ioStreams != nil {
 			if ioStreams.Out != nil {
-				stdoutWriter = ioStreams.Out
+				forwardOut = ioStreams.Out
+				streamed = true
 			}
 			if ioStreams.ErrOut != nil {
-				stderrWriter = io.MultiWriter(&stderr, ioStreams.ErrOut)
+				forwardErr = ioStreams.ErrOut
+				streamed = true
 			}
-		} else {
-			// No host-provided IO streams — stream directly to process stdout/stderr so
-			// long-running processes produce output in real-time instead of buffering
-			// until exit.
-			stdoutWriter = os.Stdout
-			stderrWriter = io.MultiWriter(&stderr, os.Stderr)
-		}
-	} else {
-		mode, _ := sdkprovider.ExecutionModeFromContext(ctx)
-		if mode == sdkprovider.CapabilityAction {
-			if ioStreams, ok := sdkprovider.IOStreamsFromContext(ctx); ok && ioStreams != nil {
-				if ioStreams.Out != nil {
-					stdoutWriter = io.MultiWriter(&stdout, ioStreams.Out)
-					streamed = true
-				}
-				if ioStreams.ErrOut != nil {
-					stderrWriter = io.MultiWriter(&stderr, ioStreams.ErrOut)
-				}
-			}
+		} else if passthrough, ok := inputs["passthrough"].(bool); ok && passthrough {
+			// Explicit passthrough with no host IO streams: tee directly to process
+			// stdout/stderr so long-running processes display output in real-time.
+			forwardOut = os.Stdout
+			forwardErr = os.Stderr
+			streamed = true
 		}
 	}
 
+	var forwardMu sync.Mutex
+	stdout := &captureWriter{forward: forwardOut, forwardMu: &forwardMu}
+	stderr := &captureWriter{forward: forwardErr, forwardMu: &forwardMu}
+
 	// Echo option: print the resolved command to stderr before executing.
-	// Always writes to the terminal stderr (ioStreams.ErrOut or os.Stderr),
+	// Always writes to the terminal stderr (streamErr, ioStreams.ErrOut, or os.Stderr),
 	// never to the capture buffer, so it doesn't pollute data["stderr"].
 	if echo, _ := inputs["echo"].(bool); echo {
-		var echoOut io.Writer = os.Stderr
-		if ioStreams, ok := sdkprovider.IOStreamsFromContext(ctx); ok && ioStreams != nil && ioStreams.ErrOut != nil {
-			echoOut = ioStreams.ErrOut
+		echoOut := forwardErr
+		if echoOut == nil {
+			if ioStreams, ok := sdkprovider.IOStreamsFromContext(ctx); ok && ioStreams != nil && ioStreams.ErrOut != nil {
+				echoOut = ioStreams.ErrOut
+			} else {
+				echoOut = os.Stderr
+			}
 		}
 		var sb strings.Builder
 		sb.WriteString("> ")
@@ -562,7 +658,7 @@ func executeCommand(ctx context.Context, command string, inputs map[string]any, 
 		}
 		sb.WriteString(shellexec.BuildFullCommand(command, args))
 		sb.WriteString("\n")
-		_, _ = fmt.Fprint(echoOut, sb.String())
+		_, _ = stderr.WriteForward(echoOut, sb.String())
 	}
 
 	// Build run options.
@@ -572,8 +668,8 @@ func executeCommand(ctx context.Context, command string, inputs map[string]any, 
 		Shell:   shell,
 		Dir:     workingDir,
 		Env:     env,
-		Stdout:  stdoutWriter,
-		Stderr:  stderrWriter,
+		Stdout:  stdout,
+		Stderr:  stderr,
 	}
 	if stdin != nil {
 		opts.Stdin = stdin
@@ -581,16 +677,20 @@ func executeCommand(ctx context.Context, command string, inputs map[string]any, 
 
 	// Execute command.
 	result, err := shellexec.RunWithContext(cmdCtx, opts)
+	stdout.StopForward()
+	stderr.StopForward()
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute command: %w", err)
 	}
 
 	// Build full command string for output.
 	fullCmd := shellexec.BuildFullCommand(command, args)
+	stdoutStr := stdout.String()
+	stderrStr := stderr.String()
 
 	fullResult := map[string]any{
-		"stdout":   stdout.String(),
-		"stderr":   stderr.String(),
+		"stdout":   stdoutStr,
+		"stderr":   stderrStr,
 		"exitCode": result.ExitCode,
 		"success":  result.ExitCode == 0,
 		"command":  fullCmd,
@@ -603,10 +703,10 @@ func executeCommand(ctx context.Context, command string, inputs map[string]any, 
 		if mode, modeOK := sdkprovider.ExecutionModeFromContext(ctx); modeOK &&
 			(mode == sdkprovider.CapabilityFrom || mode == sdkprovider.CapabilityTransform) {
 			return &sdkprovider.Output{
-				Data: strings.TrimSpace(stdout.String()),
+				Data: strings.TrimSpace(stdoutStr),
 				Metadata: map[string]any{
 					"exitCode": result.ExitCode,
-					"stderr":   stderr.String(),
+					"stderr":   stderrStr,
 				},
 				Streamed: streamed,
 			}, nil
@@ -668,19 +768,25 @@ func resolvePath(ctx context.Context, path string) (string, error) {
 	return filepath.Clean(filepath.Join(base, path)), nil
 }
 
-// shouldFailOnError determines whether the provider should return an error for
-// non-zero exit codes. If the user explicitly sets failOnError, that takes
-// precedence. Otherwise the default depends on the execution mode: true for
-// action capability (fail-fast), false for from/transform (exit code inspection).
-func shouldFailOnError(ctx context.Context, inputs map[string]any) bool {
-	if explicit, ok := inputs["failOnError"].(bool); ok {
+// shouldStream determines whether stdout and stderr should be streamed live.
+// Explicit passthrough takes precedence; otherwise CapabilityAction streams by
+// default while from, transform, and unset modes buffer by default.
+func shouldStream(ctx context.Context, inputs map[string]any) bool {
+	if explicit, ok := inputs["passthrough"].(bool); ok {
 		return explicit
 	}
 	mode, ok := sdkprovider.ExecutionModeFromContext(ctx)
-	if !ok {
-		return false
+	return ok && mode == sdkprovider.CapabilityAction
+}
+
+// shouldFailOnError determines whether the provider should return an error for
+// non-zero exit codes. Defaults to true across all capabilities unless the
+// caller explicitly sets failOnError: false.
+func shouldFailOnError(inputs map[string]any) bool {
+	if explicit, ok := inputs["failOnError"].(bool); ok {
+		return explicit
 	}
-	return mode == sdkprovider.CapabilityAction
+	return true
 }
 
 // extractExitInfo reads the exit code and stderr from a provider output.
